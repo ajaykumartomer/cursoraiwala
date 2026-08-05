@@ -2245,7 +2245,7 @@ def main():
                     archive_completed_url(manual_url, note="manual Enter-URL")
                     write_job_log(
                         url=manual_url,
-                        downloaded_files=saved_list,
+                        downloaded_files=[p.name for p in saved_list],
                         processed_ok=ok_names,
                         processed_fail=fail_names,
                         success=s,
