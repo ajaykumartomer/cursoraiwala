@@ -566,6 +566,8 @@ DONE_FOLDER           = IMAGE_FOLDER / "Image to Prompt Done"
 OUTPUT_COMBINED_FILE  = IMAGE_FOLDER / "combined_image_output.txt"
 URL_PICKER_FILE       = SCRIPT_DIR / "Image to Prompt URL Picker.txt"
 URL_PICKER_FAILED     = SCRIPT_DIR / "Image to Prompt URL Picker Failed.txt"
+URL_PICKER_DONE       = SCRIPT_DIR / "Image to Prompt URL Picker Done.txt"
+JOB_LOG_FILE          = SCRIPT_DIR / "Image to Prompt Job Log.txt"
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 
@@ -1206,6 +1208,11 @@ def load_urls_from_picker() -> List[str]:
 
 
 def remove_url_from_picker(url: str) -> bool:
+    """
+    Erase this URL from the active picker after the job finishes
+    (same pattern as Ultimate Media Tool URL Picker).
+    Remaining lines in the picker = unfinished balance.
+    """
     if not url or not URL_PICKER_FILE.exists():
         return False
     try:
@@ -1231,14 +1238,150 @@ def remove_url_from_picker(url: str) -> bool:
                 new_lines.append(line)
         if removed:
             URL_PICKER_FILE.write_text("".join(new_lines), encoding="utf-8")
-            print_step("+", f"Removed completed URL from {URL_PICKER_FILE.name}", C.GREEN)
+            remaining = load_urls_from_picker()
+            print_step(
+                "+",
+                f"Erased completed URL from {URL_PICKER_FILE.name} "
+                f"(remaining balance: {len(remaining)} URL(s))",
+                C.GREEN,
+            )
             return True
     except Exception as e:
         print_step("!", f"Could not remove URL from picker: {e}", C.YELLOW)
     return False
 
 
-def quarantine_url_as_failed(url: str, reason: str = "") -> None:
+def archive_completed_url(url: str, note: str = "") -> None:
+    """Append completed URL to Done archive so you keep a permanent download record."""
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp}\t{url}"
+        if note:
+            line += f"\t# {note}"
+        line += "\n"
+        with open(URL_PICKER_DONE, "a", encoding="utf-8") as f:
+            f.write(line)
+        print_step("+", f"Recorded in {URL_PICKER_DONE.name}", C.GREEN)
+    except Exception as e:
+        print_step("!", f"Could not write Done URL archive: {e}", C.YELLOW)
+
+
+def rotator_balance_plain(rotator: "GeminiApiKeyRotator") -> str:
+    """Plain-text key balance (RPM/RPD remaining) for job log — no ANSI colors."""
+    now = time.time()
+    lines = []
+    for k in rotator.keys:
+        rotator._refresh_windows(k)
+        rpm_left = max(0, rotator.ROTATE_AT_RPM - k["rpm_count"])
+        rpd_left = max(0, rotator.ROTATE_AT_RPD - k["rpd_count"])
+        if k["disabled"]:
+            status = "DISABLED"
+        elif k["cooldown_until"] > now:
+            status = f"COOLDOWN {int(k['cooldown_until'] - now)}s"
+        else:
+            status = "active"
+        lines.append(
+            f"  Key #{k['slot']} ({_mask_user_id(k['user_id'])}): "
+            f"RPM {k['rpm_count']}/{rotator.RPM_LIMIT} (left~{rpm_left}) | "
+            f"RPD {k['rpd_count']}/{rotator.RPD_LIMIT} (left~{rpd_left}) | {status}"
+        )
+    return "\n".join(lines)
+
+
+def write_job_log(
+    *,
+    url: str,
+    downloaded_files: List[str],
+    processed_ok: List[str],
+    processed_fail: List[str],
+    success: int,
+    failed: int,
+    rotator: "GeminiApiKeyRotator",
+    status: str,
+) -> None:
+    """
+    Permanent job record: what was downloaded, what succeeded, URL picker balance,
+    and API key RPM/RPD balance after this job.
+    """
+    try:
+        remaining_urls = load_urls_from_picker()
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        block = []
+        block.append("=" * 80)
+        block.append(f"JOB COMPLETE  {stamp}")
+        block.append(f"Status       : {status}")
+        block.append(f"URL          : {url}")
+        block.append(f"Downloaded   : {len(downloaded_files)} file(s)")
+        for name in downloaded_files:
+            block.append(f"  + {name}")
+        block.append(f"Processed OK : {success}")
+        for name in processed_ok:
+            block.append(f"  + {name}")
+        block.append(f"Processed FAIL: {failed}")
+        for name in processed_fail:
+            block.append(f"  ! {name}")
+        block.append(f"URL picker remaining balance: {len(remaining_urls)} URL(s)")
+        for u in remaining_urls:
+            block.append(f"  ~ {u}")
+        block.append("API key balance after job:")
+        block.append(rotator_balance_plain(rotator))
+        block.append("")
+        with open(JOB_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(block) + "\n")
+        print_step("+", f"Job record saved → {JOB_LOG_FILE.name}", C.GREEN)
+    except Exception as e:
+        print_step("!", f"Could not write job log: {e}", C.YELLOW)
+
+
+def finish_url_job(
+    url: str,
+    saved_list: List[Path],
+    processed_ok: List[str],
+    processed_fail: List[str],
+    success: int,
+    failed: int,
+    rotator: "GeminiApiKeyRotator",
+) -> None:
+    """
+    After a picker URL job finishes (download + process):
+      1. Erase URL from active picker (remaining lines = unfinished balance)
+      2. Archive URL in Done.txt
+      3. Append full job record (files + key balance) to Job Log.txt
+    Matches Ultimate Media Tool: remove URL when the job for that URL completes.
+    """
+    downloaded = [p.name for p in saved_list]
+    if success > 0:
+        status = "OK" if failed == 0 else f"PARTIAL ({success} ok, {failed} fail)"
+        remove_url_from_picker(url)
+        archive_completed_url(
+            url,
+            note=f"{success} ok / {failed} fail / {len(downloaded)} downloaded",
+        )
+        write_job_log(
+            url=url,
+            downloaded_files=downloaded,
+            processed_ok=processed_ok,
+            processed_fail=processed_fail,
+            success=success,
+            failed=failed,
+            rotator=rotator,
+            status=status,
+        )
+    else:
+        print_step("!", "Processing failed — URL kept in picker for retry", C.YELLOW)
+        write_job_log(
+            url=url,
+            downloaded_files=downloaded,
+            processed_ok=processed_ok,
+            processed_fail=processed_fail,
+            success=success,
+            failed=failed,
+            rotator=rotator,
+            status="FAILED — URL kept in picker",
+        )
+
+
+def quarantine_url_as_failed(url: str, reason: str = "", rotator: Optional["GeminiApiKeyRotator"] = None) -> None:
     """Move a permanently-failed URL out of the active picker so it won't retry forever."""
     remove_url_from_picker(url)
     try:
@@ -1252,6 +1395,17 @@ def quarantine_url_as_failed(url: str, reason: str = "") -> None:
         print_step("~", f"URL moved to {URL_PICKER_FAILED.name} (no infinite retry)", C.YELLOW)
     except Exception as e:
         print_step("!", f"Could not write failed-URL log: {e}", C.YELLOW)
+    if rotator is not None:
+        write_job_log(
+            url=url,
+            downloaded_files=[],
+            processed_ok=[],
+            processed_fail=[],
+            success=0,
+            failed=0,
+            rotator=rotator,
+            status=f"QUARANTINED — {reason}",
+        )
 
 
 def _looks_permanent_download_error(log_text: str) -> bool:
@@ -1312,13 +1466,18 @@ def _is_instagram_url(url: str) -> bool:
     return "instagram.com" in low or "instagr.am" in low
 
 
-def _snapshot_files(dest_folder: Path) -> set:
-    """Relative-path snapshot of all files under dest_folder."""
-    snap = set()
+def _snapshot_files(dest_folder: Path) -> Dict[str, Tuple[int, int]]:
+    """Relative-path → (mtime_ns, size) snapshot of all files under dest_folder."""
+    snap: Dict[str, Tuple[int, int]] = {}
     try:
         for p in dest_folder.rglob("*"):
             if p.is_file():
-                snap.add(str(p.relative_to(dest_folder)).replace("\\", "/").lower())
+                rel = str(p.relative_to(dest_folder)).replace("\\", "/").lower()
+                try:
+                    st = p.stat()
+                    snap[rel] = (st.st_mtime_ns, st.st_size)
+                except Exception:
+                    snap[rel] = (0, 0)
     except Exception:
         pass
     return snap
@@ -1375,16 +1534,22 @@ def _dedupe_thumbnail_variants(images: List[Path]) -> List[Path]:
     return kept
 
 
-def _collect_new_valid_images(dest_folder: Path, before_relpaths: set) -> List[Path]:
-    """Return newly created valid still images under dest_folder (recursive), flattened + deduped."""
+def _collect_new_valid_images(dest_folder: Path, before_meta: Dict[str, Tuple[int, int]]) -> List[Path]:
+    """Return new OR updated valid still images under dest_folder, flattened + deduped."""
     found: List[Path] = []
     try:
         for p in dest_folder.rglob("*"):
             if not p.is_file():
                 continue
             rel = str(p.relative_to(dest_folder)).replace("\\", "/").lower()
-            if rel in before_relpaths:
+            try:
+                st = p.stat()
+                meta = (st.st_mtime_ns, st.st_size)
+            except Exception:
                 continue
+            prev = before_meta.get(rel)
+            if prev is not None and prev == meta:
+                continue  # unchanged
             if p.suffix.lower() not in VALID_EXTENSIONS:
                 continue
             try:
@@ -1404,13 +1569,16 @@ def _collect_new_valid_images(dest_folder: Path, before_relpaths: set) -> List[P
             continue
         target = dest_folder / p.name
         n = 1
-        while target.exists():
+        while target.exists() and target.resolve() != p.resolve():
             target = dest_folder / f"{p.stem}_{n}{p.suffix}"
             n += 1
-        try:
-            shutil.move(str(p), str(target))
-            flattened.append(target)
-        except Exception:
+        if target.resolve() != p.resolve():
+            try:
+                shutil.move(str(p), str(target))
+                flattened.append(target)
+            except Exception:
+                flattened.append(p)
+        else:
             flattened.append(p)
 
     return _dedupe_thumbnail_variants(flattened)
@@ -1815,12 +1983,16 @@ def main():
     ensure_url_picker_file()
     picker_urls = load_urls_from_picker()
 
-    def process_image_list(images: List[Path], serial_start: int) -> Tuple[int, int, int]:
+    def process_image_list(
+        images: List[Path], serial_start: int
+    ) -> Tuple[int, int, int, List[str], List[str]]:
         if not images:
-            return 0, 0, serial_start
+            return 0, 0, serial_start, [], []
         serial = serial_start
         success = 0
         failed = 0
+        processed_ok: List[str] = []
+        processed_fail: List[str] = []
         run_start_time = time.time()
         next_pause_time = run_start_time + (MAX_RUN_TIME_MIN * 60)
 
@@ -1848,6 +2020,7 @@ def main():
             img = prepare_image(image_path)
             if img is None:
                 failed += 1
+                processed_fail.append(image_path.name)
                 continue
 
             print_step("~", f"Prepared {img.size[0]}x{img.size[1]}px", C.DIM)
@@ -1855,6 +2028,7 @@ def main():
 
             if parsed is None:
                 failed += 1
+                processed_fail.append(image_path.name)
                 print_step("!", f"Failed on {image_path.name}\n", C.RED)
             else:
                 master = parsed.get("master_prompt", "")
@@ -1865,11 +2039,12 @@ def main():
                 write_output(serial, image_path.name, master, forensic)
                 move_to_done(image_path, serial)
                 print_step("+", f"Image No. {serial} written successfully\n", C.GREEN)
+                processed_ok.append(f"Image No. {serial} — {image_path.name}")
                 serial += 1
                 success += 1
                 time.sleep(REQUEST_DELAY_SEC)
 
-        return success, failed, serial
+        return success, failed, serial, processed_ok, processed_fail
 
     total_success = 0
     total_failed = 0
@@ -1883,29 +2058,33 @@ def main():
         )
         for i, url in enumerate(picker_urls, start=1):
             print(f"  {C.BOLD}[Picker URL {i}/{len(picker_urls)}] {url}{C.RESET}")
-            saved_list, dl_log, permanent = download_image_from_url(url, IMAGE_FOLDER)
-            if not saved_list:
-                if permanent:
-                    print_step("!", "Permanent download failure — URL quarantined", C.RED)
-                    quarantine_url_as_failed(url, reason="permanent download failure")
-                else:
-                    print_step("!", "Download failed — URL kept in picker for retry", C.YELLOW)
+            try:
+                saved_list, dl_log, permanent = download_image_from_url(url, IMAGE_FOLDER)
+                if not saved_list:
+                    if permanent:
+                        print_step("!", "Permanent download failure — URL quarantined", C.RED)
+                        quarantine_url_as_failed(
+                            url, reason="permanent download failure", rotator=rotator
+                        )
+                    else:
+                        print_step("!", "Download failed — URL kept in picker for retry", C.YELLOW)
+                    total_dl_failed += 1
+                    continue
+                print_step("+", f"Downloaded {len(saved_list)} still image(s) from URL", C.GREEN)
+                s, f, serial, ok_names, fail_names = process_image_list(saved_list, serial)
+                total_success += s
+                total_failed += f
+                # Job finished → erase URL from picker + write download/balance record
+                finish_url_job(url, saved_list, ok_names, fail_names, s, f, rotator)
+            except Exception as e:
+                print_step("!", f"Picker URL job failed (URL kept in file): {e}", C.RED)
                 total_dl_failed += 1
-                continue
-            print_step("+", f"Downloaded {len(saved_list)} still image(s) from URL", C.GREEN)
-            s, f, serial = process_image_list(saved_list, serial)
-            total_success += s
-            total_failed += f
-            if s > 0:
-                remove_url_from_picker(url)
-            else:
-                print_step("!", "Processing failed — URL kept in picker for retry", C.YELLOW)
             print()
         remaining, serial2 = manage_files()
         serial = max(serial, serial2)
         if remaining:
             print_step("~", f"Also found {len(remaining)} local image(s) to process...", C.CYAN)
-            s, f, serial = process_image_list(remaining, serial)
+            s, f, serial, _, _ = process_image_list(remaining, serial)
             total_success += s
             total_failed += f
     else:
@@ -1915,9 +2094,22 @@ def main():
             saved_list, dl_log, permanent = download_image_from_url(manual_url, IMAGE_FOLDER)
             if saved_list:
                 print_step("+", f"Downloaded {len(saved_list)} still image(s) from URL", C.GREEN)
-                s, f, serial = process_image_list(saved_list, serial)
+                s, f, serial, ok_names, fail_names = process_image_list(saved_list, serial)
                 total_success += s
                 total_failed += f
+                # Manual URL is not in picker, but still write job record for balance tracking
+                write_job_log(
+                    url=manual_url,
+                    downloaded_files=[p.name for p in saved_list],
+                    processed_ok=ok_names,
+                    processed_fail=fail_names,
+                    success=s,
+                    failed=f,
+                    rotator=rotator,
+                    status="OK (manual URL)" if s > 0 else "FAILED (manual URL)",
+                )
+                if s > 0:
+                    archive_completed_url(manual_url, note=f"manual | {s} ok / {f} fail")
             else:
                 print_step("!", "Manual URL download failed", C.YELLOW)
                 if permanent:
@@ -1938,21 +2130,25 @@ def main():
             print(f"  Social: Instagram photo/carousel posts via gallery-dl + yt-dlp")
             return
         if images:
-            s, f, serial = process_image_list(images, serial)
+            s, f, serial, _, _ = process_image_list(images, serial)
             total_success += s
             total_failed += f
 
+    remaining_balance = load_urls_from_picker()
     print(f"\n{C.CYAN}{C.BOLD}  ==== FINISHED ===={C.RESET}")
     print_step("+", f"Successfully processed: {total_success}", C.GREEN)
     print_step("!", f"Failed image processing (still in source folder): {total_failed}",
                C.RED if total_failed else C.DIM)
     print_step("!", f"Failed URL downloads: {total_dl_failed}",
                C.RED if total_dl_failed else C.DIM)
+    print_step("+", f"URL picker remaining balance: {len(remaining_balance)} URL(s)", C.CYAN)
     print(f"\n{rotator.get_status_summary()}\n")
     print(f"\n  Output file:\n  {C.CYAN}{OUTPUT_COMBINED_FILE}{C.RESET}")
     print(f"  Done folder:\n  {C.CYAN}{DONE_FOLDER}{C.RESET}")
-    print(f"  URL picker:\n  {C.CYAN}{URL_PICKER_FILE}{C.RESET}")
-    print(f"  Failed URLs:\n  {C.CYAN}{URL_PICKER_FAILED}{C.RESET}\n")
+    print(f"  URL picker (active / remaining):\n  {C.CYAN}{URL_PICKER_FILE}{C.RESET}")
+    print(f"  URL picker Done (completed record):\n  {C.CYAN}{URL_PICKER_DONE}{C.RESET}")
+    print(f"  Failed URLs:\n  {C.CYAN}{URL_PICKER_FAILED}{C.RESET}")
+    print(f"  Job log (files + key balance):\n  {C.CYAN}{JOB_LOG_FILE}{C.RESET}\n")
 
 
 if __name__ == "__main__":
