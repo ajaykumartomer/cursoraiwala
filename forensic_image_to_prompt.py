@@ -3,10 +3,11 @@ r"""
   FORENSIC IMAGE-TO-PROMPT ENGINE  |  Gemini Flash (auto model fallback)
   - ALL libraries ONLY in:  C:\AKT Media Tools
   - Images + output in:     folder of this .py  \  Image to Prompt
-  - Done folder:            Image to Prompt Done  (files renamed with Image No.)
+  - Done folder:            Image to Prompt Done  (files renamed: Image 1 xxx.jpg)
   - Force-install packages into C:\AKT Media Tools\Lib\site-packages
   - Auto UAC elevation when needed
   - Continuous numbering | Master + Forensic | Auto-Done + Dedup
+  - Naming (Ultimate Media Tool style): Image 1 originalname.jpg
   - ONE-CLICK: Gemini API keys from USER_CONFIG only (top block) — 12-key rotation
   - Model auto-fallback: gemini-3.6-flash → 3.5 → 3.1-lite → 2.5 → 2.0
   - If USER_THEMATIC_OVERRIDES are blank → pure original image (zero manipulation)
@@ -15,8 +16,11 @@ r"""
   - Key-switch delay: 600 seconds between API keys (same-IP multi-account protection)
   - URL Picker: "Image to Prompt URL Picker.txt" in script folder
       * auto-created if missing
-      * if any URL present → download + process first; remove URL only on success
-      * permanent download failures → moved to Failed picker (no infinite retry)
+      * if any URL present → download + process first
+      * after job completes → URL erased from picker (remaining = unfinished balance)
+      * completed URLs archived in "Image to Prompt URL Picker Done.txt"
+      * job record (files + key RPM/RPD balance) → "Image to Prompt Job Log.txt"
+      * permanent download failures → "Image to Prompt URL Picker Failed.txt"
       * if picker empty → Enter URL prompt (8s auto-skip) then local images
   - Download: direct image via urllib | Instagram/social via gallery-dl + yt-dlp
     (photo carousels: 1 best thumbnail per slide, not all quality variants)
@@ -571,6 +575,19 @@ JOB_LOG_FILE          = SCRIPT_DIR / "Image to Prompt Job Log.txt"
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 
+# Ultimate Media Tool-style rename: "Image 1 originalname.jpg"
+_RE_DONE_NAME = re.compile(r"(?i)^Image(?:\s+No\.)?\s+(\d+)\s+")
+
+
+def _is_already_named_output(filename: str) -> bool:
+    """Skip files already renamed as Image N ... (or legacy Image No. N ...)."""
+    return bool(_RE_DONE_NAME.match(filename or ""))
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize like Ultimate Media Tool (Windows-illegal chars → _)."""
+    return re.sub(r'[<>:"/\\|?*]', "_", name or "image")
+
 REQUEST_DELAY_SEC     = 5
 MAX_RETRIES           = 4
 RETRY_BASE_DELAY      = 8
@@ -976,7 +993,7 @@ def find_all_images() -> List[Path]:
             for p in folder.iterdir():
                 if not p.is_file():
                     continue
-                if p.name.lower().startswith("image no."):
+                if _is_already_named_output(p.name):
                     continue
                 ext = p.suffix.lower()
                 if ext in VALID_EXTENSIONS:
@@ -1859,36 +1876,54 @@ def get_url_with_timeout(timeout_sec: float = 8.0) -> Optional[str]:
 
 
 def get_starting_number() -> int:
-    if not OUTPUT_COMBINED_FILE.exists():
-        return 1
+    """
+    Continuous numbering across runs.
+    Reads highest 'Image N' / legacy 'Image No. N' from output log and Done folder.
+    """
     last = 0
-    try:
-        with open(OUTPUT_COMBINED_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("Image No.") or line.startswith("Image "):
-                    try:
-                        num = int(line.split(".")[0].split()[-1])
-                        last = max(last, num)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+    # From combined output log
+    if OUTPUT_COMBINED_FILE.exists():
+        try:
+            with open(OUTPUT_COMBINED_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"(?i)^Image(?:\s+No\.)?\s+(\d+)\b", line.strip())
+                    if m:
+                        last = max(last, int(m.group(1)))
+        except Exception:
+            pass
+    # From Done folder filenames: "Image 1 foo.jpg"
+    if DONE_FOLDER.exists():
+        try:
+            for p in DONE_FOLDER.iterdir():
+                if not p.is_file():
+                    continue
+                m = _RE_DONE_NAME.match(p.name)
+                if m:
+                    last = max(last, int(m.group(1)))
+        except Exception:
+            pass
     return last + 1
 
 
 def move_to_done(path: Path, image_num: int):
+    """Rename like Ultimate Media Tool: Image 1 originalname.jpg"""
     DONE_FOLDER.mkdir(parents=True, exist_ok=True)
-    new_name = f"Image No. {image_num} {path.name}"
+    safe_name = _safe_filename(path.name)
+    new_name = f"Image {image_num} {safe_name}"
     target = DONE_FOLDER / new_name
     counter = 1
     while target.exists():
-        target = DONE_FOLDER / f"Image No. {image_num} {path.stem}_{counter}{path.suffix}"
+        stem = Path(safe_name).stem
+        ext = Path(safe_name).suffix
+        target = DONE_FOLDER / f"Image {image_num} {stem}_{counter}{ext}"
         counter += 1
     try:
         shutil.move(str(path), str(target))
         print_step("+", f"Moved → Image to Prompt Done\\{target.name}", C.GREEN)
+        return target.name
     except Exception as e:
         print_step("!", f"Could not move to Done: {e}", C.YELLOW)
+        return new_name
 
 
 def manage_files() -> Tuple[List[Path], int]:
@@ -1897,7 +1932,7 @@ def manage_files() -> Tuple[List[Path], int]:
         existing = [
             p for p in IMAGE_FOLDER.iterdir()
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
-            and not p.name.lower().startswith("image no.")
+            and not _is_already_named_output(p.name)
         ]
         if existing:
             _dedupe_thumbnail_variants(existing)
@@ -1927,9 +1962,10 @@ def manage_files() -> Tuple[List[Path], int]:
 
 
 def write_output(num: int, filename: str, master_prompt: str, forensic_analysis: dict):
+    """Write like Ultimate Media Tool log titles: Image 1 (filename)"""
     IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_COMBINED_FILE, "a", encoding="utf-8") as f:
-        f.write(f"Image No. {num}. ({filename})\n\n")
+        f.write(f"Image {num} ({filename})\n\n")
         f.write("\t==== MASTER PROMPT (Copy-Paste Ready) ====\n")
         f.write(f"\t{master_prompt}\n\n")
         f.write("\t==== FORENSIC ANALYSIS ====\n")
@@ -1996,7 +2032,7 @@ def main():
         run_start_time = time.time()
         next_pause_time = run_start_time + (MAX_RUN_TIME_MIN * 60)
 
-        print_step("+", f"Processing {len(images)} image(s). Starting at Image No. {serial}\n", C.GREEN)
+        print_step("+", f"Processing {len(images)} image(s). Starting at Image {serial}\n", C.GREEN)
         print(f"  {C.BOLD}Active Run Time:{C.RESET} {MAX_RUN_TIME_MIN} mins  |  "
               f"{C.BOLD}Pause Time:{C.RESET} {PAUSE_TIME_MIN} mins\n")
 
@@ -2034,12 +2070,12 @@ def main():
                 master = parsed.get("master_prompt", "")
                 forensic = parsed.get("forensic_analysis", {})
                 preview = textwrap.shorten(str(master), width=120, placeholder="...")
-                print_step("+", f"Analysis complete → Image No. {serial}", C.GREEN)
+                print_step("+", f"Analysis complete → Image {serial}", C.GREEN)
                 print(f"      {C.DIM}Preview: {preview}{C.RESET}")
                 write_output(serial, image_path.name, master, forensic)
-                move_to_done(image_path, serial)
-                print_step("+", f"Image No. {serial} written successfully\n", C.GREEN)
-                processed_ok.append(f"Image No. {serial} — {image_path.name}")
+                done_name = move_to_done(image_path, serial)
+                print_step("+", f"{done_name} written successfully\n", C.GREEN)
+                processed_ok.append(f"Image {serial} — {done_name}")
                 serial += 1
                 success += 1
                 time.sleep(REQUEST_DELAY_SEC)
