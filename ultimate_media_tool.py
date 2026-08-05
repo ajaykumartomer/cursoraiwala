@@ -889,8 +889,7 @@ class ApiKeyRotator:
                     f"{self._label(old)} → {self._label(new)} "
                     f"(reason: {reason}){C.RESET}"
                 )
-                if self._last_switched_from is not None or True:
-                    self._apply_key_switch_delay(old["slot"], new["slot"], reason)
+                self._apply_key_switch_delay(old["slot"], new["slot"], reason)
             self.current_idx = idx
             self._last_switched_from = prev_idx
             return self.keys[idx]["key"]
