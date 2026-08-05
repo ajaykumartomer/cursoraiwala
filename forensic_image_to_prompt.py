@@ -132,6 +132,7 @@ import re
 import textwrap
 import urllib.request
 import ssl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -828,7 +829,7 @@ def print_banner() -> None:
 {C.CYAN}{C.BOLD}
  +----+
  |   FORENSIC IMAGE-TO-PROMPT ENGINE  (ONE-CLICK)                 |
- |   Libs: C:\\AKT Media Tools  |  Continuous Numbering            |
+ |   Libs: C:\\AKT Media Tools  |  Naming: Image 1 xxx.jpg            |
  |   Gemini Flash (auto model) | Master + Forensic | Auto-Done + Dedup |
  |   12-Key Rotation | Active 10 min / Pause 10 min loop          |
  |   Sort: EXIF Date created FIRST (earliest first)               |
@@ -1605,11 +1606,199 @@ def _gallery_dl_available() -> bool:
     return _package_present_in_target("gallery_dl", "gallery-dl")
 
 
+def _http_get_bytes(url: str, referer: str = "https://www.instagram.com/", timeout: int = 30) -> Optional[bytes]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer,
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _http_download_image(url: str, dest: Path, referer: str = "https://www.instagram.com/") -> bool:
+    data = _http_get_bytes(url, referer=referer, timeout=30)
+    if not data or len(data) < 100:
+        return False
+    try:
+        with open(dest, "wb") as out:
+            out.write(data)
+        with Image.open(dest) as im:
+            im.verify()
+        return True
+    except Exception:
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _best_image_url_from_entry(entry: dict) -> Optional[str]:
+    """Pick the largest still-image URL from a yt-dlp info dict."""
+    if not entry or not isinstance(entry, dict):
+        return None
+
+    candidates: List[Tuple[int, str]] = []
+
+    for f in (entry.get("formats") or []):
+        if not isinstance(f, dict):
+            continue
+        u = f.get("url")
+        if not u:
+            continue
+        ext = (f.get("ext") or "").lower()
+        vcodec = (f.get("vcodec") or "none").lower()
+        acodec = (f.get("acodec") or "none").lower()
+        # Still image formats (Instagram photo slides)
+        is_image = ext in ("jpg", "jpeg", "png", "webp") or (
+            vcodec in ("", "none") and acodec in ("", "none") and ext not in ("mp4", "m4a", "webm", "mkv")
+        )
+        if not is_image:
+            continue
+        area = int(f.get("width") or 0) * int(f.get("height") or 0)
+        candidates.append((area, u))
+
+    for t in (entry.get("thumbnails") or []):
+        if not isinstance(t, dict):
+            continue
+        u = t.get("url")
+        if not u:
+            continue
+        area = int(t.get("width") or 0) * int(t.get("height") or 0)
+        # Prefer higher id / preference when present
+        pref = int(t.get("preference") or t.get("id") or 0)
+        candidates.append((area * 10 + pref, u))
+
+    thumb = entry.get("thumbnail")
+    if thumb:
+        candidates.append((1, thumb))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _guess_ext_from_url(url: str) -> str:
+    low = (url or "").lower().split("?")[0]
+    for cand in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if low.endswith(cand):
+            return cand
+    return ".jpg"
+
+
+def download_instagram_fast(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
+    """
+    FAST Instagram path (carousel-friendly):
+      1) One yt-dlp -J metadata fetch (no media download)
+      2) Parallel CDN image downloads (ThreadPool)
+    Much faster than sequential write-thumbnail / gallery-dl.
+    """
+    if not _ensure_ytdlp():
+        return [], "yt-dlp not available"
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    print_step("~", "Instagram FAST: metadata only (yt-dlp -J)...", C.CYAN)
+    cmd = [
+        str(YTDLP_PATH),
+        url,
+        "-J",
+        "--ignore-no-formats-error",
+        "--no-warnings",
+        "--socket-timeout", "15",
+        "--retries", "2",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=75,
+        )
+    except subprocess.TimeoutExpired:
+        return [], "yt-dlp -J timed out (75s)"
+    except Exception as e:
+        return [], f"yt-dlp -J failed: {e}"
+
+    raw = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if not raw:
+        return [], err[-500:] or "empty yt-dlp -J output"
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return [], f"JSON parse failed: {e} | stderr={err[-200:]}"
+
+    if data.get("_type") == "playlist":
+        entries = [e for e in (data.get("entries") or []) if isinstance(e, dict)]
+    else:
+        entries = [data]
+
+    jobs: List[Tuple[str, Path]] = []
+    for i, entry in enumerate(entries, start=1):
+        img_url = _best_image_url_from_entry(entry)
+        if not img_url:
+            continue
+        eid = re.sub(r"[^\w\-]+", "_", str(entry.get("id") or i))[:48]
+        ext = _guess_ext_from_url(img_url)
+        dest = dest_folder / f"{eid}_{i}{ext}"
+        n = 1
+        while dest.exists():
+            dest = dest_folder / f"{eid}_{i}_{n}{ext}"
+            n += 1
+        jobs.append((img_url, dest))
+
+    if not jobs:
+        return [], "no image URLs found in Instagram metadata"
+
+    print_step("~", f"Instagram FAST: parallel download of {len(jobs)} image(s)...", C.CYAN)
+    saved: List[Path] = []
+
+    def _one(job: Tuple[str, Path]) -> Optional[Path]:
+        img_url, dest = job
+        if _http_download_image(img_url, dest, referer=url):
+            return dest
+        return None
+
+    workers = min(8, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, j) for j in jobs]
+        for fut in as_completed(futures):
+            try:
+                p = fut.result()
+            except Exception:
+                p = None
+            if p is not None:
+                saved.append(p)
+                print_step("+", f"Saved → {p.name} ({p.stat().st_size} bytes)", C.GREEN)
+
+    elapsed = time.time() - t0
+    saved.sort(key=lambda x: x.name.lower())
+    print_step(
+        "+",
+        f"Instagram FAST: {len(saved)}/{len(jobs)} image(s) in {elapsed:.1f}s",
+        C.GREEN if saved else C.YELLOW,
+    )
+    if not saved:
+        return [], f"parallel CDN download failed ({len(jobs)} urls) | {err[-200:]}"
+    return saved, f"instagram-fast ok {len(saved)}/{len(jobs)} in {elapsed:.1f}s"
+
+
 def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
-    """
-    Best path for Instagram photo / carousel posts.
-    Returns (images, combined_log).
-    """
+    """Optional fallback for Pinterest/Reddit galleries (not used first for Instagram)."""
     if not _gallery_dl_available():
         return [], "gallery-dl not installed"
     dest_folder.mkdir(parents=True, exist_ok=True)
@@ -1621,8 +1810,7 @@ def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], st
         "--filter", "extension in ('jpg','jpeg','png','webp','gif')",
         url,
     ]
-    print_step("~", f"gallery-dl downloading images: {url[:80]}...", C.DIM)
-    log = ""
+    print_step("~", f"gallery-dl: {url[:80]}...", C.DIM)
     try:
         proc = subprocess.run(
             cmd,
@@ -1630,15 +1818,11 @@ def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], st
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=240,
+            timeout=120,
             cwd=str(dest_folder),
             env={**os.environ, "PYTHONPATH": SITE_PACKAGES + os.pathsep + os.environ.get("PYTHONPATH", "")},
         )
         log = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        for line in log.splitlines():
-            low = line.lower()
-            if any(x in low for x in ("download", "error", "#", "http", "writing")):
-                print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
         images = _collect_new_valid_images(dest_folder, before)
         if images:
             for p in images:
@@ -1646,111 +1830,92 @@ def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], st
             return images, log
         return [], log
     except subprocess.TimeoutExpired:
-        return [], "gallery-dl timed out (240s)"
+        return [], "gallery-dl timed out (120s)"
     except Exception as e:
         return [], f"gallery-dl failed: {e}"
 
 
 def download_via_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
     """
-    Social download via yt-dlp.
-    For Instagram image-only / carousel posts: write thumbnails + ignore missing video formats.
-    Returns (images, combined_log).
+    Quiet yt-dlp fallback.
+    Instagram: single thumbs-only pass (no slow media pass).
+    Other social: one media+thumb pass with ignore-no-formats-error.
     """
     if not _ensure_ytdlp():
         print_step("!", "yt-dlp not available — cannot download social media posts", C.RED)
         return [], "yt-dlp not available"
     dest_folder.mkdir(parents=True, exist_ok=True)
     before = _snapshot_files(dest_folder)
-    out_tmpl = str(dest_folder / "%(id)s_%(playlist_index|)s%(playlist_index&_)s%(title).60B.%(ext)s")
+    out_tmpl = str(dest_folder / "%(id)s_%(playlist_index|)s%(playlist_index&_)s%(title).40B.%(ext)s")
 
-    # Pass 1: media download + ONE thumbnail per item (not all quality variants)
-    # Do NOT use --no-playlist — Instagram carousels must keep all items
-    # Do NOT use --write-all-thumbnails — that creates 10+ junk sizes per slide
-    cmd_media = [
-        str(YTDLP_PATH),
-        url,
-        "-o", out_tmpl,
-        "--no-mtime",
-        "--ignore-no-formats-error",
-        "--write-thumbnail",
-        "--convert-thumbnails", "jpg",
-        "--retries", "3",
-    ]
-    # Pass 2 (image-only fallback): skip media, only one thumbnail per item
-    cmd_thumbs = [
-        str(YTDLP_PATH),
-        url,
-        "-o", out_tmpl,
-        "--no-mtime",
-        "--skip-download",
-        "--ignore-no-formats-error",
-        "--write-thumbnail",
-        "--convert-thumbnails", "jpg",
-        "--retries", "3",
-    ]
+    if _is_instagram_url(url):
+        cmd = [
+            str(YTDLP_PATH), url,
+            "-o", out_tmpl,
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "--no-mtime",
+            "--no-warnings",
+            "--socket-timeout", "15",
+            "--retries", "2",
+        ]
+        label = "ig-thumbs"
+    else:
+        cmd = [
+            str(YTDLP_PATH), url,
+            "-o", out_tmpl,
+            "--ignore-no-formats-error",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "--no-mtime",
+            "--no-warnings",
+            "--socket-timeout", "20",
+            "--retries", "2",
+        ]
+        label = "media+thumbs"
 
-    combined_log = ""
-
-    def _run(cmd: List[str], label: str) -> str:
-        print_step("~", f"yt-dlp [{label}]: {url[:80]}...", C.DIM)
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
-            )
-            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            for line in out.splitlines():
-                low = line.lower()
-                if any(x in low for x in ("download", "100%", "error", "destination", "writing", "thumbnail")):
-                    print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
-            return out
-        except subprocess.TimeoutExpired:
-            print_step("!", f"yt-dlp [{label}] timed out (180s)", C.RED)
-            return f"yt-dlp [{label}] timed out"
-        except Exception as e:
-            print_step("!", f"yt-dlp [{label}] failed: {e}", C.RED)
-            return f"yt-dlp [{label}] failed: {e}"
-
-    combined_log += _run(cmd_media, "media+thumbs")
-    images = _collect_new_valid_images(dest_folder, before)
-    if images:
-        for p in images:
-            print_step("+", f"Saved via yt-dlp → {p.name}", C.GREEN)
-        return images, combined_log
-
-    # Image-only Instagram posts often need skip-download + thumbnails
-    if _is_instagram_url(url) or "no video formats found" in combined_log.lower():
-        before2 = _snapshot_files(dest_folder)
-        combined_log += "\n" + _run(cmd_thumbs, "thumbs-only")
-        images = _collect_new_valid_images(dest_folder, before2)
+    print_step("~", f"yt-dlp [{label}]: {url[:80]}...", C.DIM)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+        )
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        # Keep console quiet — only show errors
+        for line in out.splitlines():
+            if "error" in line.lower():
+                print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
+        images = _collect_new_valid_images(dest_folder, before)
         if images:
             for p in images:
-                print_step("+", f"Saved via yt-dlp thumbnail → {p.name}", C.GREEN)
-            return images, combined_log
-
-    print_step("!", "yt-dlp finished but no new still image in folder", C.YELLOW)
-    err_tail = combined_log[-400:] if combined_log else ""
-    if err_tail.strip():
-        print(f"      {C.DIM}{err_tail.strip()[:300]}{C.RESET}")
-    return [], combined_log
+                print_step("+", f"Saved via yt-dlp → {p.name}", C.GREEN)
+            return images, out
+        print_step("!", "yt-dlp finished but no new still image", C.YELLOW)
+        return [], out
+    except subprocess.TimeoutExpired:
+        print_step("!", f"yt-dlp [{label}] timed out (90s)", C.RED)
+        return [], f"yt-dlp [{label}] timed out"
+    except Exception as e:
+        print_step("!", f"yt-dlp [{label}] failed: {e}", C.RED)
+        return [], f"yt-dlp [{label}] failed: {e}"
 
 
 def download_image_from_url(url: str, dest_folder: Path) -> Tuple[List[Path], str, bool]:
     """
-    Smart download:
+    Smart download (speed-first):
       1. Direct image URL → urllib
-      2. Instagram / image social → gallery-dl first, then yt-dlp thumbnail fallback
-      3. Other social → yt-dlp, then gallery-dl
+      2. Instagram → FAST metadata + parallel CDN (then quiet yt-dlp fallback)
+      3. Other social → quiet yt-dlp, then gallery-dl
     Returns: (images, log, permanent_failure_hint)
     """
     dest_folder.mkdir(parents=True, exist_ok=True)
     logs: List[str] = []
-    permanent = False
 
     if _is_direct_image_url(url) or not _is_social_media_url(url):
         path_part = url.split("?")[0].rstrip("/")
@@ -1764,81 +1929,54 @@ def download_image_from_url(url: str, dest_folder: Path) -> Tuple[List[Path], st
             dest = dest_folder / f"{stem}_{n}{ext}"
             n += 1
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": url,
-        }
         print_step("~", f"Downloading (direct): {url[:100]}...", C.DIM)
-        for attempt in range(1, 3):
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                # Keep SSL verification ON (do not disable)
-                with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
-                    shutil.copyfileobj(resp, out)
-                if not dest.exists() or dest.stat().st_size < 100:
-                    try:
-                        dest.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    continue
-                try:
-                    with Image.open(dest) as im:
-                        im.verify()
-                    print_step("+", f"Saved → {dest.name} ({dest.stat().st_size} bytes)", C.GREEN)
-                    return [dest], "direct ok", False
-                except Exception:
-                    print_step("!", f"Not a valid image: {dest.name}", C.YELLOW)
-                    try:
-                        dest.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            except Exception as e:
-                msg = f"Direct download attempt {attempt}: {e}"
-                print_step("!", msg, C.YELLOW)
-                logs.append(msg)
-                try:
-                    if dest.exists():
-                        dest.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
+        if _http_download_image(url, dest, referer=url):
+            print_step("+", f"Saved → {dest.name} ({dest.stat().st_size} bytes)", C.GREEN)
+            return [dest], "direct ok", False
+        logs.append("direct download failed")
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
         if _is_direct_image_url(url):
-            return [], "\n".join(logs), _looks_permanent_download_error("\n".join(logs))
+            return [], "\n".join(logs), True
         if not _is_social_media_url(url):
             print_step("~", "Direct failed — trying social downloaders...", C.DIM)
 
-    # Instagram / Pinterest etc: prefer gallery-dl (designed for image galleries)
-    if _is_instagram_url(url) or "pinterest.com" in url.lower() or "reddit.com" in url.lower():
-        imgs, log = download_via_gallery_dl(url, dest_folder)
+    # Instagram: FAST path first (skip slow gallery-dl / dual yt-dlp passes)
+    if _is_instagram_url(url):
+        imgs, log = download_instagram_fast(url, dest_folder)
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
-        print_step("~", "gallery-dl produced no images — trying yt-dlp thumbnail path...", C.DIM)
+        print_step("~", "FAST path incomplete — quiet yt-dlp thumbnail fallback...", C.DIM)
         imgs, log = download_via_ytdlp(url, dest_folder)
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
-        permanent = _looks_permanent_download_error("\n".join(logs))
-        return [], "\n".join(logs), permanent
+        return [], "\n".join(logs), _looks_permanent_download_error("\n".join(logs))
+
+    if "pinterest.com" in url.lower() or "reddit.com" in url.lower():
+        imgs, log = download_via_gallery_dl(url, dest_folder)
+        logs.append(log)
+        if imgs:
+            return imgs, "\n".join(logs), False
+        imgs, log = download_via_ytdlp(url, dest_folder)
+        logs.append(log)
+        if imgs:
+            return imgs, "\n".join(logs), False
+        return [], "\n".join(logs), _looks_permanent_download_error("\n".join(logs))
 
     if _is_social_media_url(url):
         imgs, log = download_via_ytdlp(url, dest_folder)
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
-        # Secondary: gallery-dl for other hosts it supports
         imgs, log = download_via_gallery_dl(url, dest_folder)
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
-        permanent = _looks_permanent_download_error("\n".join(logs))
-        return [], "\n".join(logs), permanent
+        return [], "\n".join(logs), _looks_permanent_download_error("\n".join(logs))
 
     return [], "\n".join(logs), False
 
