@@ -1,29 +1,42 @@
-# Forensic Image-to-Prompt Engine
+# Forensic Media-to-Prompt Engines
 
-One-click Gemini 2.5 Flash script that turns images (local or Instagram/social URLs) into forensic reconstruction prompts.
+One-click Gemini Flash scripts that turn local or Instagram/social media into forensic reconstruction prompts (Windows-oriented; libraries under `C:\AKT Media Tools`).
 
-## File
+## Files
 
-- `forensic_image_to_prompt.py` — main script (Windows-oriented; libraries under `C:\AKT Media Tools`)
+| Script | Purpose |
+|--------|---------|
+| `forensic_image_to_prompt.py` | Images → master + forensic prompts |
+| `forensic_video_to_prompt.py` | Videos → 1-FPS frames → pin-point master + shot list + forensic prompts |
 
 ## Setup
 
-1. Paste your Gemini API keys into the `USER_CONFIG` block at the top of the script (replace `YOUR_GEMINI_API_KEY_*` placeholders).
+1. Paste Gemini API keys into the `USER_CONFIG` block at the top of the script (replace `YOUR_GEMINI_API_KEY_*` placeholders).
 2. **Do not commit real keys.** Rotate any key that was ever pasted into chat or committed.
-3. Run the script. It installs Pillow, google-genai, and gallery-dl into `C:\AKT Media Tools\Lib\site-packages`.
+3. Run the script. Packages install into `C:\AKT Media Tools\Lib\site-packages`.
+   - Image: Pillow, google-genai, gallery-dl
+   - Video: Pillow, opencv-python, google-genai, gallery-dl (+ yt-dlp.exe under Tools)
 
-## Instagram / social downloads
+## Shared behavior (both scripts)
 
-- **gallery-dl** is preferred for Instagram photo posts and carousels.
-- **yt-dlp** is used as fallback with `--ignore-no-formats-error` + thumbnail extraction (image-only posts no longer fail with “No video formats found” and zero files).
-- All downloaded stills from a carousel are processed (not just the first).
-- Permanent download failures are moved to `Image to Prompt URL Picker Failed.txt` so they do not retry forever.
+- Gemini model auto-fallback: `3.6-flash` → `3.5` → `3.1-flash-lite` → `2.5` → `2.0`
+- 12-key rotation with RPM/RPD thresholds + 600s key-switch delay
+- 10-minute active / 10-minute pause loop
+- URL Picker + Done / Failed / Job Log (Ultimate Media Tool style)
+- Blank thematic overrides → pure original reconstruction
+- Naming: `Image 1 …` / `Video 1 …` (legacy `No.` still counted)
 
-## Folders
+## Image engine
 
-| Path | Purpose |
-|------|---------|
-| `Image to Prompt\` | Source images + `combined_image_output.txt` |
-| `Image to Prompt\Image to Prompt Done\` | Processed images |
-| `Image to Prompt URL Picker.txt` | URLs to download |
-| `Image to Prompt URL Picker Failed.txt` | Quarantined permanent failures |
+- **gallery-dl** preferred for Instagram photo / carousel posts
+- **yt-dlp** fallback with `--ignore-no-formats-error` + one thumbnail per slide
+- Folders: `Image to Prompt\`, URL picker files named `Image to Prompt URL Picker*.txt`
+
+## Video engine
+
+- OpenCV **1-FPS** frame extraction (max 60 frames, resized ≤768px)
+- Pin-point second-by-second direction / face / object tracking in the prompt
+- **yt-dlp** preferred for reels/posts (actual video), gallery-dl fallback
+- Sort: Media/EXIF date created first (earliest first)
+- Folders: `Video to Prompt\`, URL picker files named `Video to Prompt URL Picker*.txt`
+- Output: `combined_video_output.txt` (master prompt + timestamped shot list + forensic analysis)
