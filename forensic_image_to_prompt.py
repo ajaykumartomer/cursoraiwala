@@ -1,6 +1,6 @@
 r"""
 ====
-  FORENSIC IMAGE-TO-PROMPT ENGINE  |  Gemini 2.5 Flash
+  FORENSIC IMAGE-TO-PROMPT ENGINE  |  Gemini Flash (auto model fallback)
   - ALL libraries ONLY in:  C:\AKT Media Tools
   - Images + output in:     folder of this .py  \  Image to Prompt
   - Done folder:            Image to Prompt Done  (files renamed with Image No.)
@@ -8,6 +8,7 @@ r"""
   - Auto UAC elevation when needed
   - Continuous numbering | Master + Forensic | Auto-Done + Dedup
   - ONE-CLICK: Gemini API keys from USER_CONFIG only (top block) — 12-key rotation
+  - Model auto-fallback: gemini-3.6-flash → 3.5 → 3.1-lite → 2.5 → 2.0
   - If USER_THEMATIC_OVERRIDES are blank → pure original image (zero manipulation)
   - 10-minute active / 10-minute pause loop (API friendly)
   - Image order: EXIF Date created FIRST (earliest first) → file created → mtime → name
@@ -18,7 +19,7 @@ r"""
       * permanent download failures → moved to Failed picker (no infinite retry)
       * if picker empty → Enter URL prompt (8s auto-skip) then local images
   - Download: direct image via urllib | Instagram/social via gallery-dl + yt-dlp
-    (photo carousels supported; yt-dlp thumbnail fallback for image-only posts)
+    (photo carousels: 1 best thumbnail per slide, not all quality variants)
 ====
 """
 
@@ -575,6 +576,17 @@ MAX_IMAGE_PX          = 3072
 MAX_RUN_TIME_MIN      = 10
 PAUSE_TIME_MIN        = 10
 
+# Gemini model preference (2.5-flash is blocked for many new API keys → 404).
+# First working model is cached for the rest of the run.
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+_RESOLVED_GEMINI_MODEL: Optional[str] = None
+
 # Patterns that mean "this social URL will never work with our downloaders as-is"
 _PERMANENT_DL_HINTS = (
     "no video formats found",
@@ -798,11 +810,11 @@ def print_banner() -> None:
  +----+
  |   FORENSIC IMAGE-TO-PROMPT ENGINE  (ONE-CLICK)                 |
  |   Libs: C:\\AKT Media Tools  |  Continuous Numbering            |
- |   Gemini 2.5 Flash | Master + Forensic | Auto-Done + Dedup     |
+ |   Gemini Flash (auto model) | Master + Forensic | Auto-Done + Dedup |
  |   12-Key Rotation | Active 10 min / Pause 10 min loop          |
  |   Sort: EXIF Date created FIRST (earliest first)               |
  |   Key-switch delay: 600s | URL Picker + 8s Enter-URL prompt    |
- |   Download: direct | gallery-dl + yt-dlp (Instagram photos OK) |
+ |   Download: direct | gallery-dl + yt-dlp (1 thumb per slide)   |
  +----+
 {C.RESET}""")
 
@@ -1021,7 +1033,27 @@ def parse_gemini_json(raw_text: str) -> Optional[dict]:
         return None
 
 
+def _is_model_not_found_error(err_str: str) -> bool:
+    low = (err_str or "").lower()
+    return (
+        "404" in err_str
+        or "not_found" in low
+        or "no longer available" in low
+        or "is not found" in low
+        or "was not found" in low
+    ) and ("model" in low or "models/" in low)
+
+
+def _model_candidates() -> List[str]:
+    global _RESOLVED_GEMINI_MODEL
+    if _RESOLVED_GEMINI_MODEL:
+        rest = [m for m in GEMINI_MODEL_CANDIDATES if m != _RESOLVED_GEMINI_MODEL]
+        return [_RESOLVED_GEMINI_MODEL] + rest
+    return list(GEMINI_MODEL_CANDIDATES)
+
+
 def call_gemini_with_retry(rotator: "GeminiApiKeyRotator", img: Image.Image, filename: str) -> Optional[dict]:
+    global _RESOLVED_GEMINI_MODEL
     delay = RETRY_BASE_DELAY
     final_system_prompt = FORENSIC_SYSTEM_PROMPT
     overrides_empty = is_overrides_empty(USER_THEMATIC_OVERRIDES)
@@ -1063,47 +1095,79 @@ You MUST force both forensic_analysis and especially the master_prompt to obey t
             print_step("!", "All API keys exhausted / cooling down → waiting 60s before retry", C.YELLOW)
             time.sleep(60)
             continue
-        try:
-            client = genai.Client(api_key=key)
-            print_step("~", f"Sending to Gemini 2.5 Flash  (Key #{idx + 1} / {_mask_user_id(user_id or '')})...", C.DIM)
-            rotator.record_request(idx)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[final_system_prompt, img]
-            )
-            raw = response.text.strip()
-            parsed = parse_gemini_json(raw)
-            if parsed and "master_prompt" in parsed:
-                return parsed
-            return {
-                "master_prompt": raw,
-                "forensic_analysis": {},
-                "_raw_fallback": True
-            }
-        except Exception as exc:
-            err_str = str(exc)
-            low = err_str.lower()
-            if "429" in err_str or "quota" in low or "rate limit" in low or "resource_exhausted" in low:
-                retry_after = None
-                m = re.search(r"retry(?:[-_ ]?after)?[^0-9]{0,20}(\d+)", low)
-                if m:
-                    try:
-                        retry_after = float(m.group(1))
-                    except Exception:
-                        retry_after = None
-                print_step("~", f"[{filename}] Attempt {attempt}: rate-limit/quota on Key #{idx + 1}", C.YELLOW)
-                rotator.handle_rate_limit(idx, retry_after)
+        client = genai.Client(api_key=key)
+        last_err = ""
+        model_404_all = True
+        # Count one attempt against the key, not one per model fallback try
+        rotator.record_request(idx)
+        for model_name in _model_candidates():
+            try:
+                print_step(
+                    "~",
+                    f"Sending to {model_name}  (Key #{idx + 1} / {_mask_user_id(user_id or '')})...",
+                    C.DIM,
+                )
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[final_system_prompt, img],
+                )
+                if _RESOLVED_GEMINI_MODEL != model_name:
+                    _RESOLVED_GEMINI_MODEL = model_name
+                    print_step("+", f"Using Gemini model: {model_name}", C.GREEN)
+                raw = response.text.strip()
+                parsed = parse_gemini_json(raw)
+                if parsed and "master_prompt" in parsed:
+                    return parsed
+                return {
+                    "master_prompt": raw,
+                    "forensic_analysis": {},
+                    "_raw_fallback": True,
+                }
+            except Exception as exc:
+                err_str = str(exc)
+                last_err = err_str
+                low = err_str.lower()
+                if "429" in err_str or "quota" in low or "rate limit" in low or "resource_exhausted" in low:
+                    model_404_all = False
+                    retry_after = None
+                    m = re.search(r"retry(?:[-_ ]?after)?[^0-9]{0,20}(\d+)", low)
+                    if m:
+                        try:
+                            retry_after = float(m.group(1))
+                        except Exception:
+                            retry_after = None
+                    print_step("~", f"[{filename}] Attempt {attempt}: rate-limit/quota on Key #{idx + 1}", C.YELLOW)
+                    rotator.handle_rate_limit(idx, retry_after)
+                    break
+                if ("401" in err_str or "403" in err_str
+                        or "permission_denied" in low or "permission denied" in low
+                        or "unauthorized" in low or "api key not valid" in low
+                        or "api_key_invalid" in low or "invalid api key" in low):
+                    model_404_all = False
+                    print_step("~", f"[{filename}] Attempt {attempt}: auth error on Key #{idx + 1}", C.YELLOW)
+                    rotator.handle_auth_error(idx)
+                    break
+                if _is_model_not_found_error(err_str):
+                    print_step("~", f"Model {model_name} unavailable → trying next", C.YELLOW)
+                    continue
+                model_404_all = False
+                print_step("~", f"[{filename}] Attempt {attempt} failed: {err_str[:90]}... Retry in {delay}s", C.YELLOW)
+                time.sleep(delay)
+                delay *= 2
+                break
+        else:
+            # exhausted model list
+            if model_404_all:
+                print_step(
+                    "!",
+                    f"[{filename}] No usable Gemini model (tried {', '.join(GEMINI_MODEL_CANDIDATES)})",
+                    C.RED,
+                )
+                print_step("~", f"Last error: {last_err[:160]}", C.DIM)
+                # Do NOT disable the API key — this is a model-ID issue, not auth.
+                time.sleep(delay)
+                delay *= 2
                 continue
-            if ("401" in err_str or "403" in err_str
-                    or "permission_denied" in low or "permission denied" in low
-                    or "unauthorized" in low or "api key not valid" in low
-                    or "api_key_invalid" in low or "invalid api key" in low):
-                print_step("~", f"[{filename}] Attempt {attempt}: auth error on Key #{idx + 1}", C.YELLOW)
-                rotator.handle_auth_error(idx)
-                continue
-            print_step("~", f"[{filename}] Attempt {attempt} failed: {err_str[:90]}... Retry in {delay}s", C.YELLOW)
-            time.sleep(delay)
-            delay *= 2
     return None
 
 
@@ -1260,8 +1324,59 @@ def _snapshot_files(dest_folder: Path) -> set:
     return snap
 
 
+def _thumbnail_group_key(path: Path) -> str:
+    """
+    Group yt-dlp multi-quality thumbnails of the same carousel slide.
+    e.g. 'DbYGxpiCXHs_1_Video by parasmadan.in.0.jpg'
+      →  'DbYGxpiCXHs_1_Video by parasmadan.in'
+    """
+    name = path.name
+    # Strip trailing .N before extension (thumbnail quality index 0..N)
+    m = re.match(r"^(.*)\.(\d+)(\.[^.]+)$", name)
+    if m:
+        return m.group(1).lower()
+    return path.stem.lower()
+
+
+def _dedupe_thumbnail_variants(images: List[Path]) -> List[Path]:
+    """
+    Keep ONE best still per carousel slide (largest file). Delete the rest.
+    Prevents 8 slides × 13 thumbnail sizes = 104 junk images.
+    """
+    if not images:
+        return []
+    groups: Dict[str, List[Path]] = {}
+    for p in images:
+        groups.setdefault(_thumbnail_group_key(p), []).append(p)
+
+    kept: List[Path] = []
+    removed = 0
+    for key, paths in groups.items():
+        if len(paths) == 1:
+            kept.append(paths[0])
+            continue
+        # Prefer largest bytes (usually highest-res Instagram thumbnail)
+        paths_sorted = sorted(
+            paths,
+            key=lambda x: (x.stat().st_size if x.exists() else 0, x.name),
+            reverse=True,
+        )
+        best = paths_sorted[0]
+        kept.append(best)
+        for junk in paths_sorted[1:]:
+            try:
+                junk.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        print_step("~", f"Kept 1 thumbnail per slide — removed {removed} lower-res variant(s)", C.CYAN)
+    kept.sort(key=lambda x: x.name.lower())
+    return kept
+
+
 def _collect_new_valid_images(dest_folder: Path, before_relpaths: set) -> List[Path]:
-    """Return newly created valid still images under dest_folder (recursive), flattened."""
+    """Return newly created valid still images under dest_folder (recursive), flattened + deduped."""
     found: List[Path] = []
     try:
         for p in dest_folder.rglob("*"):
@@ -1272,7 +1387,6 @@ def _collect_new_valid_images(dest_folder: Path, before_relpaths: set) -> List[P
                 continue
             if p.suffix.lower() not in VALID_EXTENSIONS:
                 continue
-            # Skip yt-dlp leftover video containers mistakenly named oddly — only stills
             try:
                 with Image.open(p) as im:
                     im.verify()
@@ -1298,8 +1412,8 @@ def _collect_new_valid_images(dest_folder: Path, before_relpaths: set) -> List[P
             flattened.append(target)
         except Exception:
             flattened.append(p)
-    flattened.sort(key=lambda x: x.name.lower())
-    return flattened
+
+    return _dedupe_thumbnail_variants(flattened)
 
 
 def _gallery_dl_available() -> bool:
@@ -1365,8 +1479,9 @@ def download_via_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
     before = _snapshot_files(dest_folder)
     out_tmpl = str(dest_folder / "%(id)s_%(playlist_index|)s%(playlist_index&_)s%(title).60B.%(ext)s")
 
-    # Pass 1: try real media download + thumbnails for photo slides (carousels)
+    # Pass 1: media download + ONE thumbnail per item (not all quality variants)
     # Do NOT use --no-playlist — Instagram carousels must keep all items
+    # Do NOT use --write-all-thumbnails — that creates 10+ junk sizes per slide
     cmd_media = [
         str(YTDLP_PATH),
         url,
@@ -1374,11 +1489,10 @@ def download_via_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
         "--no-mtime",
         "--ignore-no-formats-error",
         "--write-thumbnail",
-        "--write-all-thumbnails",
         "--convert-thumbnails", "jpg",
         "--retries", "3",
     ]
-    # Pass 2 (image-only fallback): skip media, only thumbnails
+    # Pass 2 (image-only fallback): skip media, only one thumbnail per item
     cmd_thumbs = [
         str(YTDLP_PATH),
         url,
@@ -1387,7 +1501,6 @@ def download_via_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
         "--skip-download",
         "--ignore-no-formats-error",
         "--write-thumbnail",
-        "--write-all-thumbnails",
         "--convert-thumbnails", "jpg",
         "--retries", "3",
     ]
@@ -1611,6 +1724,16 @@ def move_to_done(path: Path, image_num: int):
 
 
 def manage_files() -> Tuple[List[Path], int]:
+    # Collapse leftover yt-dlp multi-quality thumbnails from previous runs
+    if IMAGE_FOLDER.exists():
+        existing = [
+            p for p in IMAGE_FOLDER.iterdir()
+            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+            and not p.name.lower().startswith("image no.")
+        ]
+        if existing:
+            _dedupe_thumbnail_variants(existing)
+
     seen: Dict[str, str] = {}
     if DONE_FOLDER.exists():
         print_step("~", "Scanning Done folder for multi-run deduplication...", C.DIM)
