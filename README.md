@@ -1,42 +1,37 @@
-# Forensic Media-to-Prompt Engines
+# AKT Media Tools — Forensic + Ultimate Media
 
-One-click Gemini Flash scripts that turn local or Instagram/social media into forensic reconstruction prompts (Windows-oriented; libraries under `C:\AKT Media Tools`).
+One-click Windows scripts. Libraries install under `C:\AKT Media Tools`.
 
-## Files
+## Scripts
 
-| Script | Purpose |
-|--------|---------|
-| `forensic_image_to_prompt.py` | Images → master + forensic prompts |
-| `forensic_video_to_prompt.py` | Videos → 1-FPS frames → pin-point master + shot list + forensic prompts |
+| File | Purpose |
+|------|---------|
+| `forensic_image_to_prompt.py` | Images → Gemini forensic reconstruction prompts |
+| `forensic_video_to_prompt.py` | Videos → 1-FPS frames → Gemini pin-point prompts |
+| `ultimate_media_tool.py` | Social download + OCR / Whisper / translate (Groq) |
+
+## Shared patterns (v0.8 parity)
+
+- URL Picker + Done / Failed / Job Log
+- gallery-dl + yt-dlp downloads (Instagram-friendly)
+- Multi-key rotation + **600s key-switch delay**
+- Masked userIDs in logs
+- Model auto-fallback
+- Repo copies use **API key placeholders only**
 
 ## Setup
 
-1. Paste Gemini API keys into the `USER_CONFIG` block at the top of the script (replace `YOUR_GEMINI_API_KEY_*` placeholders).
-2. **Do not commit real keys.** Rotate any key that was ever pasted into chat or committed.
-3. Run the script. Packages install into `C:\AKT Media Tools\Lib\site-packages`.
-   - Image: Pillow, google-genai, gallery-dl
-   - Video: Pillow, opencv-python, google-genai, gallery-dl (+ yt-dlp.exe under Tools)
+1. Replace `YOUR_GEMINI_API_KEY_*` or `YOUR_GROQ_API_KEY_*` placeholders locally.
+2. **Do not commit real keys.** Rotate any key that was pasted into chat.
+3. Put URLs in the matching `* URL Picker.txt` next to the script, or use the 8s prompt.
 
-## Shared behavior (both scripts)
+## Ultimate Media Tool folders
 
-- Gemini model auto-fallback: `3.6-flash` → `3.5` → `3.1-flash-lite` → `2.5` → `2.0`
-- 12-key rotation with RPM/RPD thresholds + 600s key-switch delay
-- 10-minute active / 10-minute pause loop
-- URL Picker + Done / Failed / Job Log (Ultimate Media Tool style)
-- Blank thematic overrides → pure original reconstruction
-- Naming: `Image 1 …` / `Video 1 …` (legacy `No.` still counted)
-
-## Image engine
-
-- **gallery-dl** preferred for Instagram photo / carousel posts
-- **yt-dlp** fallback with `--ignore-no-formats-error` + one thumbnail per slide
-- Folders: `Image to Prompt\`, URL picker files named `Image to Prompt URL Picker*.txt`
-
-## Video engine
-
-- OpenCV **1-FPS** frame extraction (max 60 frames, resized ≤768px)
-- Pin-point second-by-second direction / face / object tracking in the prompt
-- **yt-dlp** preferred for reels/posts (actual video), gallery-dl fallback
-- Sort: Media/EXIF date created first (earliest first)
-- Folders: `Video to Prompt\`, URL picker files named `Video to Prompt URL Picker*.txt`
-- Output: `combined_video_output.txt` (master prompt + timestamped shot list + forensic analysis)
+| Path | Purpose |
+|------|---------|
+| `Combined Image/Video/Audio Scraper by AKT\` | Renamed media (`Image 1 …`) |
+| `Combine Image/Video/Audio Scraper.txt` | Extraction logs |
+| `Ultimate Media Tool URL Picker.txt` | Active URL queue |
+| `Ultimate Media Tool URL Picker Done.txt` | Completed URLs |
+| `Ultimate Media Tool URL Picker Failed.txt` | Quarantined failures |
+| `Ultimate Media Tool Job Log.txt` | Download + key balance records |
