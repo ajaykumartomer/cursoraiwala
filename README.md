@@ -1,60 +1,39 @@
 # Instagram Media Downloader
 
-Fast, max-quality Instagram downloader with **automatic browser cookie scanning**.
+Windows-friendly Instagram downloader that **scans C: for browser cookies** (Firefox first), then downloads.
 
-## How auth works (important)
+## Main script (use this)
 
-Instagram blocks anonymous downloads. On start, the script:
+`ig_archiver.py` — matches the Firefox → Chrome → other browsers cookie-try flow.
 
-1. Scans **C:** user profiles for browsers in this order: **Firefox → Chrome → Edge → Brave → others**
-2. Checks Firefox `cookies.sqlite` for Instagram `sessionid`
-3. Exports those cookies to a Netscape `cookies.txt` (most reliable)
-4. Downloads the post/reel/carousel with gallery-dl + yt-dlp
-
-## Setup (Windows)
-
-```bash
+```bat
 pip install -r requirements.txt
+
+:: 1) Open Firefox → instagram.com → log in → CLOSE Firefox
+:: 2) Run:
+python ig_archiver.py
+python ig_archiver.py "https://www.instagram.com/reel/XXXX/"
+python ig_archiver.py --scan-only
+python ig_archiver.py --deep-scan
 ```
 
-Optional: install [FFmpeg](https://ffmpeg.org/) for video merges.
+Or double-click `run_instagram_downloader.bat`.
 
-**Before first run:** open **Firefox**, log into [instagram.com](https://www.instagram.com/), then close Firefox.
+### What it does
+1. Scans `C:\Users\*\AppData\...` for browsers (**Firefox → Chrome → Edge → Brave → …**)
+2. If Firefox has Instagram `sessionid`, exports `cookies.txt`
+3. Tries cookie file, then each browser via `--cookies-from-browser`
+4. Downloads reel / post / carousel with live yt-dlp output
 
-## Usage
+Saves to `%USERPROFILE%\Downloads\Instagram_Archives\`.
 
-```bash
-# Auto-scan C: for Firefox cookies, then interactive download
-python instagram_downloader.py
-
-# One URL
-python instagram_downloader.py "https://www.instagram.com/reel/XXXX/"
-
-# Scan cookies only (no download)
-python instagram_downloader.py --scan-only
-
-# Deep-scan portable browsers under Users / Program Files
-python instagram_downloader.py --deep-scan --scan-only
-
-# Force a browser / skip auto-scan
-python instagram_downloader.py --cookies-from-browser chrome URL
-python instagram_downloader.py --cookie-file cookies.txt URL
-```
-
-Standalone cookie scanner:
-
-```bash
-python browser_cookie_scanner.py
-python browser_cookie_scanner.py --deep
-python browser_cookie_scanner.py --export cookies.txt
-```
-
-Files save to `~/Downloads/Instagram_Archives/` (Windows: `C:\Users\<you>\Downloads\Instagram_Archives\`).
-
-## Files
-
+## Other files
 | File | Role |
 |---|---|
-| `instagram_downloader.py` | Main downloader (auto cookie scan + download) |
-| `browser_cookie_scanner.py` | C: browser cookie discovery (Firefox first) |
-| `requirements.txt` | yt-dlp + gallery-dl |
+| `ig_archiver.py` | **Primary** Windows archiver (your cookie-try logic + C: scan) |
+| `browser_cookie_scanner.py` | Discovers/export Firefox/Chrome cookie DBs on C: |
+| `instagram_downloader.py` | Dual engine (gallery-dl + yt-dlp) advanced option |
+| `run_instagram_downloader.bat` | Double-click launcher |
+
+## Tip
+Close Firefox before running so `cookies.sqlite` is not locked. The script copies the DB when possible, but closed browser is most reliable.
