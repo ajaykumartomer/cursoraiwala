@@ -1,1843 +1,1622 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+r"""
+====
+  FORENSIC IMAGE-TO-PROMPT ENGINE  |  Gemini Flash (auto model fallback)
+  - ALL libraries ONLY in:  C:\AKT Media Tools
+  - Images + output in:     folder of this .py  \  Image to Prompt
+  - Done folder:            Image to Prompt Done  (files renamed: Image 1 xxx.jpg)
+  - Force-install packages into C:\AKT Media Tools\Lib\site-packages
+  - Auto UAC elevation when needed
+  - Continuous numbering | Master + Forensic | Auto-Done + Dedup
+  - Naming (Ultimate Media Tool style): Image 1 originalname.jpg
+  - ONE-CLICK: Gemini API keys from USER_CONFIG only (top block) — 12-key rotation
+  - Model auto-fallback: gemini-3.6-flash → 3.5 → 3.1-lite → 2.5 → 2.0
+  - If USER_THEMATIC_OVERRIDES are blank → pure original image (zero manipulation)
+  - 10-minute active / 10-minute pause loop (API friendly)
+  - Image order: EXIF Date created FIRST (earliest first) → file created → mtime → name
+  - Key-switch delay: 600 seconds between API keys (same-IP multi-account protection)
+  - URL Picker: "Image to Prompt URL Picker.txt" in script folder
+      * auto-created if missing
+      * if any URL present → download + process first
+      * after job completes → URL erased from picker (remaining = unfinished balance)
+      * completed URLs archived in "Image to Prompt URL Picker Done.txt"
+      * job record (files + key RPM/RPD balance) → "Image to Prompt Job Log.txt"
+      * permanent download failures → "Image to Prompt URL Picker Failed.txt"
+      * if picker empty → Enter URL prompt (8s auto-skip) then local images
+  - Download: direct image via urllib | Instagram via yt-dlp + browser cookies (Firefox→Chrome→…; MEDIA ONLY) then gallery-dl | other social via gallery-dl + yt-dlp
+    (photo carousels: 1 best thumbnail per slide, not all quality variants)
+====
 """
-FORENSIC IMAGE-TO-PROMPT ENGINE
-Gemini Flash image-to-prompt workflow for local folders and URL pickup.
 
-Pipeline:
-- Download: direct image via urllib | Instagram via yt-dlp + browser cookies (Firefox→Chrome→…; MEDIA ONLY) then gallery-dl | other social via gallery-dl + yt-dlp
-- Sort: EXIF capture time first, filesystem time second
-- Analyze: Gemini Flash with rotating API keys and model fallback
-- Archive: prompts and source images into Image to Prompt Done
+# ====
+# INSTRUCTIONS
+# ====
+# 1. Put Gemini API keys in USER_CONFIG (one per numbered slot).
+# 2. Leave thematic overrides blank for pure original reconstruction.
+# 3. Put image/social URLs in "Image to Prompt URL Picker.txt" OR paste at 8s prompt.
+# 4. SECURITY: never commit real API keys. Rotate any key that was shared/pasted.
+# ====
+
+# ============================================================================
+# USER CONFIG + API KEYS  (edit only this block)
+#   Gemini free tier limits:  RPM = 10  |  RPD = 250  |  TPM = 250,000
+#   Rotator switches keys at:  RPM @ 9   |  RPD @ 249
+# ============================================================================
+USER_CONFIG = """
+
+1. Enter Gemini API Key (userID: your_email_1@example.com):		YOUR_GEMINI_API_KEY_1
+
+2. Enter Gemini API Key (userID: your_email_2@example.com):		YOUR_GEMINI_API_KEY_2
+
+3. Enter Gemini API Key (userID: your_email_3@example.com):		YOUR_GEMINI_API_KEY_3
+
+4. Enter Gemini API Key (userID: your_email_4@example.com):		YOUR_GEMINI_API_KEY_4
+
+5. Enter Gemini API Key (userID: your_email_5@example.com):		YOUR_GEMINI_API_KEY_5
+
+6. Enter Gemini API Key (userID: your_email_6@example.com):		YOUR_GEMINI_API_KEY_6
+
+7. Enter Gemini API Key (userID: your_email_7@example.com):		YOUR_GEMINI_API_KEY_7
+
+8. Enter Gemini API Key (userID: your_email_8@example.com):		YOUR_GEMINI_API_KEY_8
+
+9. Enter Gemini API Key (userID: your_email_9@example.com):		YOUR_GEMINI_API_KEY_9
+
+10. Enter Gemini API Key (userID: your_email_10@example.com):		YOUR_GEMINI_API_KEY_10
+
+11. Enter Gemini API Key (userID: your_email_11@example.com):		YOUR_GEMINI_API_KEY_11
+
+12. Enter Gemini API Key (userID: your_email_12@example.com):		YOUR_GEMINI_API_KEY_12
+
 """
+# ============================================================================
+# END USER CONFIG
+# ============================================================================
 
-from __future__ import annotations
+# ====
+# USER THEMATIC OVERRIDES
+# ====
+USER_THEMATIC_OVERRIDES = """
 
-import argparse
-import base64
-import dataclasses
-import datetime as _dt
-import hashlib
-import imghdr
-import json
-import mimetypes
-import os
-import queue
-import random
-import re
-import shutil
-import subprocess
+Art Style
+What I Require: 
+What I Don't Require:
+
+Body Rendering
+What I Require: 
+What I Don't Require:
+
+Texture
+What I Require: 
+What I Don't Require:
+
+Face
+What I Require: 
+What I Don't Require: 
+
+Cloths
+What I Require: 
+What I Don't Require: 
+
+Weapons
+What I Require: 
+What I Don't Require:
+
+Aspect Ratio
+What I Require: 
+What I Don't Require:
+
+Movement
+What I Require: 
+What I Don't Require:
+
+Any Other Information
+What I Require: 
+What I Don't Require:
+
+"""
+# ====
+# END OF USER OVERRIDES
+# ====
+
 import sys
-import tempfile
-import textwrap
-import threading
-import time
+import os
+import ctypes
+import subprocess
 import traceback
-import urllib.error
-import urllib.parse
+import importlib
+import time
+import json
+import shutil
+import hashlib
+import re
+import textwrap
 import urllib.request
+import ssl
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Optional, List, Tuple, Dict
 
 try:
-    from PIL import Image, ImageOps
-except Exception:  # pragma: no cover - optional runtime dependency
-    Image = None  # type: ignore
-    ImageOps = None  # type: ignore
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
 
-APP_TITLE = "FORENSIC IMAGE-TO-PROMPT ENGINE"
-APP_VERSION = "FINAL / Gemini Flash"
-KEY_SWITCH_DELAY_SECONDS = 600
-RPM_SOFT_LIMIT = 9
-RPM_HARD_LIMIT = 10
-RPD_SOFT_LIMIT = 249
-RPD_HARD_LIMIT = 250
-ACTIVE_WINDOW_SECONDS = 10 * 60
-PAUSE_WINDOW_SECONDS = 10 * 60
-URL_INPUT_TIMEOUT_SECONDS = 8
-DEFAULT_IMAGE_FOLDER_NAME = "Image to Prompt"
-DONE_FOLDER_NAME = "Image to Prompt Done"
-URL_PICKER_FILENAME = "Image to Prompt URL Picker.txt"
-SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".heic", ".heif"}
-DIRECT_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
-SOCIAL_DOMAINS = (
-    "instagram.com", "www.instagram.com", "instagr.am", "pinterest.com", "pin.it",
-    "reddit.com", "www.reddit.com", "x.com", "twitter.com", "tiktok.com",
-    "facebook.com", "threads.net", "tumblr.com", "flickr.com", "deviantart.com",
+
+def _mask_user_id(user_id: str) -> str:
+    """Never print full emails / account ids in console logs."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return "unknown"
+    if "@" in uid:
+        local, _, domain = uid.partition("@")
+        if len(local) <= 2:
+            return f"**@{domain}"
+        return f"{local[:2]}***@{domain}"
+    if len(uid) <= 4:
+        return "***"
+    return f"{uid[:2]}***{uid[-2:]}"
+
+
+# ====
+# GEMINI MULTI-KEY ROTATOR
+# ====
+class GeminiApiKeyRotator:
+    ROTATE_AT_RPM = 9
+    ROTATE_AT_RPD = 249
+    RPM_LIMIT = 10
+    RPD_LIMIT = 250
+    RPM_WINDOW = 60
+    RPD_WINDOW = 86400
+    KEY_SWITCH_DELAY_SECONDS = 600
+
+    def __init__(self, keys: List[Tuple[str, str, int]]):
+        now = time.time()
+        self.keys = []
+        for (key, user_id, slot) in keys:
+            self.keys.append({
+                "key": key,
+                "user_id": user_id,
+                "slot": slot,
+                "rpm_count": 0,
+                "rpm_window_start": now,
+                "rpd_count": 0,
+                "rpd_window_start": now,
+                "disabled": False,
+                "cooldown_until": 0.0,
+            })
+        self.current_idx = 0
+        self._last_switched_from = None
+
+    def _refresh_windows(self, k: dict) -> None:
+        now = time.time()
+        if now - k["rpm_window_start"] >= self.RPM_WINDOW:
+            k["rpm_count"] = 0
+            k["rpm_window_start"] = now
+        if now - k["rpd_window_start"] >= self.RPD_WINDOW:
+            k["rpd_count"] = 0
+            k["rpd_window_start"] = now
+
+    def _is_usable(self, k: dict) -> bool:
+        now = time.time()
+        if k["disabled"]:
+            return False
+        if k["cooldown_until"] > now:
+            return False
+        self._refresh_windows(k)
+        if k["rpm_count"] >= self.ROTATE_AT_RPM:
+            return False
+        if k["rpd_count"] >= self.ROTATE_AT_RPD:
+            return False
+        return True
+
+    def _apply_key_switch_delay(self, old_slot: int, new_slot: int, reason: str = "") -> None:
+        delay = max(0, int(self.KEY_SWITCH_DELAY_SECONDS))
+        if delay <= 0:
+            return
+        reason_s = f" ({reason})" if reason else ""
+        print(
+            f"  {C.YELLOW}[KEY ROTATOR] Waiting {delay}s before next key "
+            f"#{old_slot} → #{new_slot}{reason_s}...{C.RESET}"
+        )
+        time.sleep(delay)
+
+    def get_current_key(self) -> Tuple[Optional[str], Optional[str], int]:
+        n = len(self.keys)
+        prev_idx = self.current_idx
+        for offset in range(n):
+            idx = (self.current_idx + offset) % n
+            if self._is_usable(self.keys[idx]):
+                if idx != prev_idx and self._last_switched_from is not None:
+                    old_k = self.keys[prev_idx]
+                    new_k = self.keys[idx]
+                    self._apply_key_switch_delay(
+                        old_k["slot"], new_k["slot"], "skip to usable key"
+                    )
+                self.current_idx = idx
+                self._last_switched_from = prev_idx
+                k = self.keys[idx]
+                return (k["key"], k["user_id"], idx)
+        return (None, None, -1)
+
+    def record_request(self, idx: int) -> None:
+        k = self.keys[idx]
+        self._refresh_windows(k)
+        k["rpm_count"] += 1
+        k["rpd_count"] += 1
+        print(f"  {C.CYAN}[KEY ROTATOR] Key #{k['slot']} ({_mask_user_id(k['user_id'])}) "
+              f"→ RPM: {k['rpm_count']}/{self.RPM_LIMIT}, "
+              f"RPD: {k['rpd_count']}/{self.RPD_LIMIT}{C.RESET}")
+        if k["rpm_count"] >= self.ROTATE_AT_RPM or k["rpd_count"] >= self.ROTATE_AT_RPD:
+            reason = "RPM" if k["rpm_count"] >= self.ROTATE_AT_RPM else "RPD"
+            print(f"  {C.YELLOW}[KEY ROTATOR] Key #{k['slot']} ({_mask_user_id(k['user_id'])}) "
+                  f"reached {reason} threshold → pre-rotating{C.RESET}")
+            self._rotate(reason=f"{reason} threshold")
+
+    def handle_rate_limit(self, idx: int, retry_after: Optional[float] = None) -> None:
+        k = self.keys[idx]
+        wait = retry_after if retry_after else 60
+        k["cooldown_until"] = time.time() + wait
+        print(f"  {C.RED}[KEY ROTATOR] 429 on Key #{k['slot']} "
+              f"({_mask_user_id(k['user_id'])}) → cooling down {int(wait)}s{C.RESET}")
+        self._rotate(reason="429 rate limit")
+
+    def handle_auth_error(self, idx: int) -> None:
+        k = self.keys[idx]
+        k["disabled"] = True
+        print(f"  {C.RED}[KEY ROTATOR] 401/403 on Key #{k['slot']} "
+              f"({_mask_user_id(k['user_id'])}) → DISABLED for this session{C.RESET}")
+        self._rotate(reason="auth error")
+
+    def _rotate(self, reason: str = "") -> None:
+        n = len(self.keys)
+        old_idx = self.current_idx
+        old_slot = self.keys[old_idx]["slot"]
+        self.current_idx = (self.current_idx + 1) % n
+        k = self.keys[self.current_idx]
+        print(f"  {C.GREEN}[KEY ROTATOR] Now using Key #{k['slot']} "
+              f"({_mask_user_id(k['user_id'])}){C.RESET}")
+        self._apply_key_switch_delay(old_slot, k["slot"], reason or "rotate")
+        self._last_switched_from = old_idx
+
+    def all_exhausted(self) -> bool:
+        """True when no key is currently usable (disabled / cooldown / RPM / RPD)."""
+        for k in self.keys:
+            if self._is_usable(k):
+                return False
+        return True
+
+    def get_status_summary(self) -> str:
+        now = time.time()
+        lines = [f"  {C.BOLD}[KEY ROTATOR] Status Summary "
+                 f"({len(self.keys)} key(s)):{C.RESET}"]
+        for k in self.keys:
+            self._refresh_windows(k)
+            if k["disabled"]:
+                status = f"{C.RED}DISABLED{C.RESET}"
+            elif k["cooldown_until"] > now:
+                status = f"{C.YELLOW}COOLDOWN {int(k['cooldown_until'] - now)}s{C.RESET}"
+            elif k["rpm_count"] >= self.ROTATE_AT_RPM or k["rpd_count"] >= self.ROTATE_AT_RPD:
+                status = f"{C.YELLOW}threshold{C.RESET}"
+            else:
+                status = f"{C.GREEN}active{C.RESET}"
+            lines.append(
+                f"    {C.DIM}Key #{k['slot']} ({_mask_user_id(k['user_id'])}) → "
+                f"RPM: {k['rpm_count']}/{self.RPM_LIMIT}, "
+                f"RPD: {k['rpd_count']}/{self.RPD_LIMIT}{C.RESET} | {status}"
+            )
+        return "\n".join(lines)
+
+
+LIB_ROOT = r"C:\AKT Media Tools"
+SITE_PACKAGES = os.path.join(LIB_ROOT, "Lib", "site-packages")
+TOOLS_DIR = Path(LIB_ROOT) / "Tools"
+YTDLP_PATH = TOOLS_DIR / "yt-dlp.exe"
+# Pinned yt-dlp release (avoid floating "latest" without integrity checks when possible)
+YTDLP_RELEASE_TAG = "2025.10.14"
+YTDLP_DOWNLOAD_URL = (
+    f"https://github.com/yt-dlp/yt-dlp/releases/download/"
+    f"{YTDLP_RELEASE_TAG}/yt-dlp.exe"
 )
-MODEL_FALLBACK_ORDER = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]
-TOOLS_DIR = Path.home() / ".forensic_image_to_prompt" / "tools"
-SITE_PACKAGES = str(TOOLS_DIR / "site-packages")
-YTDLP_PATH = TOOLS_DIR / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp")
-GALLERY_DL_PATH = TOOLS_DIR / ("gallery-dl.exe" if os.name == "nt" else "gallery-dl")
 
 
-class C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-    WHITE = "\033[37m"
+def _script_folder() -> str:
+    try:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+    except Exception:
+        return os.getcwd()
 
 
-USER_CONFIG = r"""
-1. Enter Gemini API Key (userID: your_email_1@example.com):	AQ.YOUR_GEMINI_API_KEY_01
-2. Enter Gemini API Key (userID: your_email_2@example.com):	AQ.YOUR_GEMINI_API_KEY_02
-3. Enter Gemini API Key (userID: your_email_3@example.com):	AQ.YOUR_GEMINI_API_KEY_03
-4. Enter Gemini API Key (userID: your_email_4@example.com):	AQ.YOUR_GEMINI_API_KEY_04
-5. Enter Gemini API Key (userID: your_email_5@example.com):	AQ.YOUR_GEMINI_API_KEY_05
-6. Enter Gemini API Key (userID: your_email_6@example.com):	AQ.YOUR_GEMINI_API_KEY_06
-7. Enter Gemini API Key (userID: your_email_7@example.com):	AQ.YOUR_GEMINI_API_KEY_07
-8. Enter Gemini API Key (userID: your_email_8@example.com):	AQ.YOUR_GEMINI_API_KEY_08
-9. Enter Gemini API Key (userID: your_email_9@example.com):	AQ.YOUR_GEMINI_API_KEY_09
-10. Enter Gemini API Key (userID: your_email_10@example.com):	AQ.YOUR_GEMINI_API_KEY_10
-11. Enter Gemini API Key (userID: your_email_11@example.com):	AQ.YOUR_GEMINI_API_KEY_11
-12. Enter Gemini API Key (userID: your_email_12@example.com):	AQ.YOUR_GEMINI_API_KEY_12
-"""
-FORENSIC_SYSTEM_PROMPT = """
-FORENSIC IMAGE-TO-PROMPT ENGINE SYSTEM PROMPT
-You are a forensic image-to-prompt analyst. Convert visible image evidence into a precise prompt for faithful regeneration.
-Preserve factual observations, lighting, lens behavior, materials, composition, and negative constraints without inventing hidden context.
+MEDIA_ROOT = _script_folder()
 
-- Forensic directive 0001: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0002: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0003: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0004: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0005: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0006: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0007: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0008: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0009: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0010: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0011: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0012: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0013: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0014: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0015: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0016: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0017: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0018: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0019: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0020: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0021: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0022: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0023: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0024: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0025: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0026: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0027: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0028: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0029: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0030: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0031: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0032: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0033: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0034: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0035: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0036: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0037: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0038: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0039: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0040: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0041: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0042: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0043: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0044: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0045: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0046: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0047: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0048: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0049: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0050: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0051: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0052: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0053: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0054: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0055: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0056: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0057: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0058: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0059: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0060: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0061: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0062: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0063: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0064: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0065: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0066: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0067: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0068: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0069: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0070: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0071: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0072: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0073: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0074: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0075: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0076: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0077: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0078: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0079: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0080: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0081: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0082: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0083: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0084: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0085: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0086: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0087: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0088: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0089: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0090: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0091: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0092: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0093: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0094: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0095: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0096: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0097: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0098: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0099: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0100: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0101: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0102: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0103: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0104: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0105: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0106: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0107: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0108: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0109: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0110: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0111: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0112: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0113: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0114: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0115: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0116: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0117: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0118: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0119: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0120: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0121: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0122: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0123: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0124: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0125: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0126: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0127: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0128: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0129: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0130: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0131: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0132: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0133: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0134: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0135: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0136: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0137: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0138: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0139: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0140: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0141: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0142: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0143: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0144: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0145: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0146: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0147: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0148: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0149: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0150: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0151: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0152: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0153: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0154: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0155: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0156: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0157: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0158: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0159: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0160: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0161: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0162: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0163: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0164: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0165: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0166: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0167: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0168: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0169: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0170: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0171: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0172: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0173: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0174: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0175: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0176: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0177: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0178: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0179: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0180: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0181: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0182: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0183: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0184: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0185: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0186: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0187: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0188: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0189: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0190: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0191: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0192: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0193: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0194: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0195: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0196: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0197: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0198: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0199: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0200: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0201: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0202: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0203: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0204: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0205: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0206: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0207: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0208: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0209: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0210: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0211: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0212: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0213: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0214: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0215: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0216: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0217: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0218: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0219: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0220: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0221: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0222: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0223: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0224: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0225: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0226: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0227: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0228: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0229: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0230: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0231: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0232: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0233: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0234: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0235: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0236: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0237: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0238: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0239: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0240: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0241: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0242: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0243: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0244: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0245: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0246: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0247: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0248: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0249: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0250: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0251: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0252: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0253: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0254: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0255: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0256: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0257: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0258: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0259: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0260: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0261: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0262: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0263: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0264: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0265: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0266: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0267: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0268: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0269: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0270: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0271: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0272: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0273: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0274: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0275: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0276: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0277: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0278: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0279: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0280: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0281: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0282: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0283: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0284: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0285: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0286: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0287: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0288: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0289: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0290: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0291: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0292: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0293: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0294: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0295: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0296: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0297: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0298: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0299: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0300: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0301: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0302: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0303: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0304: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0305: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0306: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0307: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0308: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0309: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0310: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0311: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0312: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0313: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0314: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0315: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0316: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0317: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0318: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0319: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0320: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0321: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0322: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0323: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0324: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0325: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0326: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0327: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0328: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0329: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0330: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0331: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0332: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0333: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0334: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0335: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0336: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0337: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0338: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0339: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0340: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0341: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0342: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0343: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0344: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0345: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0346: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0347: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0348: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0349: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0350: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0351: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0352: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0353: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0354: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0355: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0356: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0357: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0358: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0359: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0360: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0361: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0362: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0363: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0364: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0365: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0366: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0367: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0368: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0369: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0370: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0371: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0372: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0373: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0374: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0375: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0376: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0377: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0378: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0379: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0380: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0381: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0382: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0383: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0384: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0385: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0386: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0387: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0388: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0389: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0390: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0391: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0392: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0393: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0394: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0395: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0396: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0397: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0398: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0399: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0400: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0401: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0402: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0403: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0404: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0405: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0406: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0407: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0408: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0409: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0410: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0411: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0412: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0413: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0414: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0415: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0416: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0417: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0418: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0419: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0420: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0421: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0422: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0423: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0424: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0425: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0426: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0427: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0428: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0429: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0430: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0431: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0432: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0433: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0434: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0435: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0436: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0437: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0438: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0439: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0440: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0441: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0442: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0443: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0444: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0445: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0446: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0447: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0448: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0449: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0450: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0451: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0452: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0453: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0454: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0455: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0456: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0457: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0458: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0459: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0460: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0461: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0462: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0463: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0464: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0465: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0466: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0467: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0468: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0469: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0470: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0471: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0472: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0473: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0474: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0475: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0476: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0477: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0478: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0479: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0480: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0481: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0482: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0483: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0484: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0485: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0486: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0487: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0488: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0489: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0490: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0491: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0492: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0493: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0494: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0495: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0496: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0497: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0498: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0499: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0500: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0501: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0502: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0503: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0504: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0505: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0506: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0507: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0508: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0509: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0510: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0511: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0512: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0513: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0514: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0515: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0516: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0517: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0518: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0519: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0520: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0521: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0522: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0523: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0524: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0525: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0526: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0527: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0528: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0529: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0530: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0531: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0532: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0533: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0534: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0535: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0536: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0537: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0538: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0539: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0540: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0541: inspect subject identity and count; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0542: inspect pose and gesture; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0543: inspect facial expression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0544: inspect wardrobe material; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0545: inspect object placement; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0546: inspect background geometry; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0547: inspect foreground occlusion; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0548: inspect lighting direction; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0549: inspect shadow hardness; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0550: inspect color temperature; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0551: inspect camera height; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0552: inspect lens compression; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0553: inspect depth of field; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0554: inspect texture evidence; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0555: inspect surface reflectivity; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0556: inspect weather and atmosphere; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0557: inspect time-of-day clues; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0558: inspect social-media crop behavior; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0559: inspect image artifact inspection; describe only visible evidence, rank confidence, and avoid unstated identity claims.
-- Forensic directive 0560: inspect prompt safety boundary; describe only visible evidence, rank confidence, and avoid unstated identity claims.
 
-Output format:
-1. FORENSIC CAPTION: concise literal description of the scene.
-2. GENERATION PROMPT: a complete image prompt preserving subject, composition, lens, light, palette, and atmosphere.
-3. NEGATIVE PROMPT: visible exclusions, artifacts to avoid, and style drift to suppress.
-4. TECHNICAL NOTES: EXIF/crop/quality observations when inferable from the pixels.
-"""
+def _is_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
-USER_THEMATIC_OVERRIDES: Dict[str, str] = {
-    "theme_001": (
-        "Thematic override 001: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_002": (
-        "Thematic override 002: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_003": (
-        "Thematic override 003: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_004": (
-        "Thematic override 004: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_005": (
-        "Thematic override 005: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_006": (
-        "Thematic override 006: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_007": (
-        "Thematic override 007: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_008": (
-        "Thematic override 008: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_009": (
-        "Thematic override 009: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_010": (
-        "Thematic override 010: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_011": (
-        "Thematic override 011: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_012": (
-        "Thematic override 012: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_013": (
-        "Thematic override 013: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_014": (
-        "Thematic override 014: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_015": (
-        "Thematic override 015: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_016": (
-        "Thematic override 016: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_017": (
-        "Thematic override 017: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_018": (
-        "Thematic override 018: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_019": (
-        "Thematic override 019: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_020": (
-        "Thematic override 020: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_021": (
-        "Thematic override 021: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_022": (
-        "Thematic override 022: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_023": (
-        "Thematic override 023: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_024": (
-        "Thematic override 024: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_025": (
-        "Thematic override 025: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_026": (
-        "Thematic override 026: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_027": (
-        "Thematic override 027: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_028": (
-        "Thematic override 028: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_029": (
-        "Thematic override 029: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_030": (
-        "Thematic override 030: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_031": (
-        "Thematic override 031: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_032": (
-        "Thematic override 032: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_033": (
-        "Thematic override 033: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_034": (
-        "Thematic override 034: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_035": (
-        "Thematic override 035: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_036": (
-        "Thematic override 036: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_037": (
-        "Thematic override 037: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_038": (
-        "Thematic override 038: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_039": (
-        "Thematic override 039: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_040": (
-        "Thematic override 040: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_041": (
-        "Thematic override 041: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_042": (
-        "Thematic override 042: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_043": (
-        "Thematic override 043: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_044": (
-        "Thematic override 044: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_045": (
-        "Thematic override 045: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_046": (
-        "Thematic override 046: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_047": (
-        "Thematic override 047: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_048": (
-        "Thematic override 048: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_049": (
-        "Thematic override 049: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_050": (
-        "Thematic override 050: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_051": (
-        "Thematic override 051: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_052": (
-        "Thematic override 052: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_053": (
-        "Thematic override 053: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_054": (
-        "Thematic override 054: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_055": (
-        "Thematic override 055: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_056": (
-        "Thematic override 056: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_057": (
-        "Thematic override 057: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_058": (
-        "Thematic override 058: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_059": (
-        "Thematic override 059: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_060": (
-        "Thematic override 060: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_061": (
-        "Thematic override 061: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_062": (
-        "Thematic override 062: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_063": (
-        "Thematic override 063: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_064": (
-        "Thematic override 064: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_065": (
-        "Thematic override 065: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_066": (
-        "Thematic override 066: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_067": (
-        "Thematic override 067: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_068": (
-        "Thematic override 068: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_069": (
-        "Thematic override 069: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_070": (
-        "Thematic override 070: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_071": (
-        "Thematic override 071: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_072": (
-        "Thematic override 072: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_073": (
-        "Thematic override 073: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_074": (
-        "Thematic override 074: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_075": (
-        "Thematic override 075: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_076": (
-        "Thematic override 076: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_077": (
-        "Thematic override 077: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_078": (
-        "Thematic override 078: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_079": (
-        "Thematic override 079: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_080": (
-        "Thematic override 080: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_081": (
-        "Thematic override 081: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_082": (
-        "Thematic override 082: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_083": (
-        "Thematic override 083: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_084": (
-        "Thematic override 084: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_085": (
-        "Thematic override 085: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_086": (
-        "Thematic override 086: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_087": (
-        "Thematic override 087: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_088": (
-        "Thematic override 088: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_089": (
-        "Thematic override 089: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_090": (
-        "Thematic override 090: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_091": (
-        "Thematic override 091: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_092": (
-        "Thematic override 092: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_093": (
-        "Thematic override 093: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_094": (
-        "Thematic override 094: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_095": (
-        "Thematic override 095: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_096": (
-        "Thematic override 096: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_097": (
-        "Thematic override 097: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_098": (
-        "Thematic override 098: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_099": (
-        "Thematic override 099: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "theme_100": (
-        "Thematic override 100: preserve the original forensic observation order; "
-        "emphasize concrete visible details, camera perspective, and environmental cues; "
-        "do not add brands, names, locations, or story events unless they are visible in the image."
-    ),
-    "instagram_still_image": (
-        "When the source came from Instagram, treat the downloaded media as still-image evidence only. "
-        "Do not describe reels, captions, likes, comments, account metadata, or surrounding page chrome."
-    ),
-    "direct_url_image": (
-        "When the source was a direct image URL, prioritize the pixels and file characteristics over page context."
-    ),
+
+def _pause_exit(code: int = 1):
+    try:
+        input("\n  Press Enter to exit...")
+    except Exception:
+        pass
+    sys.exit(code)
+
+
+def _relaunch_as_admin():
+    if os.name != "nt":
+        return
+    script = os.path.abspath(sys.argv[0])
+    if not os.path.isfile(script):
+        print("  ERROR: cannot find script path for elevation.")
+        _pause_exit(1)
+    params = subprocess.list2cmdline([script] + sys.argv[1:])
+    print("=" * 60)
+    print("  Administrator needed for library folder:")
+    print(f"    {LIB_ROOT}")
+    print("  Click YES on UAC")
+    print("=" * 60)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, os.path.dirname(script), 1
+        )
+        if rc <= 32:
+            print(f"\n  UAC failed/cancelled (code {rc}).")
+            print("  Right-click script / CMD -> Run as administrator")
+            _pause_exit(1)
+    except Exception as e:
+        print(f"  Elevation error: {e}")
+        _pause_exit(1)
+    sys.exit(0)
+
+
+def _grant_full_control(folder: str) -> None:
+    """Grant current user write access only (not all Users)."""
+    if os.name != "nt" or not os.path.isdir(folder):
+        return
+    user = os.environ.get("USERNAME", "")
+    if not user:
+        return
+    try:
+        subprocess.run(
+            ["icacls", folder, "/grant", f"{user}:(OI)(CI)F", "/T", "/C"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        pass
+
+
+def _can_write(folder: str) -> bool:
+    try:
+        os.makedirs(folder, exist_ok=True)
+        test = os.path.join(folder, ".write_test")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_lib_folder():
+    need = [os.path.join(LIB_ROOT, "Lib", "site-packages"), str(TOOLS_DIR)]
+    try:
+        for d in need:
+            os.makedirs(d, exist_ok=True)
+        if _can_write(LIB_ROOT):
+            if _is_admin():
+                _grant_full_control(LIB_ROOT)
+            return
+    except Exception:
+        pass
+    if os.name == "nt" and not _is_admin():
+        _relaunch_as_admin()
+        return
+    try:
+        for d in need:
+            os.makedirs(d, exist_ok=True)
+        _grant_full_control(LIB_ROOT)
+        if not _can_write(LIB_ROOT):
+            raise PermissionError(f"Cannot write: {LIB_ROOT}")
+    except Exception as e:
+        print("!" * 60)
+        print(f"  Cannot prepare library folder: {LIB_ROOT}")
+        print(f"  Error: {e}")
+        print("!" * 60)
+        _pause_exit(1)
+
+
+def _ensure_media_folder():
+    try:
+        os.makedirs(MEDIA_ROOT, exist_ok=True)
+        test = os.path.join(MEDIA_ROOT, ".write_test_media")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test)
+    except Exception as e:
+        print("!" * 60)
+        print(f"  Cannot write media folder: {MEDIA_ROOT}")
+        print(f"  Error: {e}")
+        print("!" * 60)
+        _pause_exit(1)
+
+
+def _package_present_in_target(imp_name: str, pip_name: str) -> bool:
+    checks = []
+    if imp_name == "PIL":
+        checks += [
+            os.path.join(SITE_PACKAGES, "PIL"),
+            os.path.join(SITE_PACKAGES, "Pillow"),
+        ]
+    elif imp_name == "google.genai":
+        checks += [
+            os.path.join(SITE_PACKAGES, "google", "genai"),
+            os.path.join(SITE_PACKAGES, "google_genai"),
+            os.path.join(SITE_PACKAGES, "google-genai"),
+        ]
+    elif imp_name == "gallery_dl":
+        checks += [
+            os.path.join(SITE_PACKAGES, "gallery_dl"),
+        ]
+    else:
+        checks += [
+            os.path.join(SITE_PACKAGES, imp_name),
+            os.path.join(SITE_PACKAGES, pip_name),
+            os.path.join(SITE_PACKAGES, pip_name.replace("-", "_")),
+        ]
+    for c in checks:
+        if os.path.isdir(c) or os.path.isfile(c):
+            return True
+    try:
+        for name in os.listdir(SITE_PACKAGES):
+            low = name.lower()
+            if low.startswith(pip_name.lower().replace("-", "_")) and low.endswith((".dist-info", ".egg-info")):
+                return True
+            if low.startswith(pip_name.lower()) and low.endswith(".dist-info"):
+                return True
+            if imp_name == "PIL" and low.startswith("pillow") and low.endswith(".dist-info"):
+                return True
+            if ("google_genai" in low or "google-genai" in low) and low.endswith(".dist-info"):
+                return True
+            if "gallery_dl" in low and low.endswith(".dist-info"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+_ensure_lib_folder()
+_ensure_media_folder()
+
+if SITE_PACKAGES in sys.path:
+    sys.path.remove(SITE_PACKAGES)
+sys.path.insert(0, SITE_PACKAGES)
+
+try:
+    import site
+    for p in (site.getsitepackages() or []):
+        if p and p not in sys.path:
+            sys.path.append(p)
+    try:
+        usp = site.getusersitepackages()
+        if usp and usp not in sys.path:
+            sys.path.append(usp)
+    except Exception:
+        pass
+except Exception:
+    pass
+
+REQUIRED_PACKAGES = {
+    "PIL": "Pillow",
+    "google.genai": "google-genai",
+    "gallery_dl": "gallery-dl",
 }
 
-FORENSIC_DETAIL_CANON: Tuple[str, ...] = (
-    "Canon note 0001: verify silhouette separation before composing the final prompt.",
-    "Canon note 0002: verify specular highlight map before composing the final prompt.",
-    "Canon note 0003: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0004: verify fabric weave before composing the final prompt.",
-    "Canon note 0005: verify edge acuity before composing the final prompt.",
-    "Canon note 0006: verify motion blur vector before composing the final prompt.",
-    "Canon note 0007: verify background vanishing point before composing the final prompt.",
-    "Canon note 0008: verify reflected color cast before composing the final prompt.",
-    "Canon note 0009: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0010: verify compression block pattern before composing the final prompt.",
-    "Canon note 0011: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0012: verify scene scale cue before composing the final prompt.",
-    "Canon note 0013: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0014: verify visible text handling before composing the final prompt.",
-    "Canon note 0015: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0016: verify fine hair detail before composing the final prompt.",
-    "Canon note 0017: verify silhouette separation before composing the final prompt.",
-    "Canon note 0018: verify specular highlight map before composing the final prompt.",
-    "Canon note 0019: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0020: verify fabric weave before composing the final prompt.",
-    "Canon note 0021: verify edge acuity before composing the final prompt.",
-    "Canon note 0022: verify motion blur vector before composing the final prompt.",
-    "Canon note 0023: verify background vanishing point before composing the final prompt.",
-    "Canon note 0024: verify reflected color cast before composing the final prompt.",
-    "Canon note 0025: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0026: verify compression block pattern before composing the final prompt.",
-    "Canon note 0027: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0028: verify scene scale cue before composing the final prompt.",
-    "Canon note 0029: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0030: verify visible text handling before composing the final prompt.",
-    "Canon note 0031: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0032: verify fine hair detail before composing the final prompt.",
-    "Canon note 0033: verify silhouette separation before composing the final prompt.",
-    "Canon note 0034: verify specular highlight map before composing the final prompt.",
-    "Canon note 0035: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0036: verify fabric weave before composing the final prompt.",
-    "Canon note 0037: verify edge acuity before composing the final prompt.",
-    "Canon note 0038: verify motion blur vector before composing the final prompt.",
-    "Canon note 0039: verify background vanishing point before composing the final prompt.",
-    "Canon note 0040: verify reflected color cast before composing the final prompt.",
-    "Canon note 0041: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0042: verify compression block pattern before composing the final prompt.",
-    "Canon note 0043: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0044: verify scene scale cue before composing the final prompt.",
-    "Canon note 0045: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0046: verify visible text handling before composing the final prompt.",
-    "Canon note 0047: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0048: verify fine hair detail before composing the final prompt.",
-    "Canon note 0049: verify silhouette separation before composing the final prompt.",
-    "Canon note 0050: verify specular highlight map before composing the final prompt.",
-    "Canon note 0051: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0052: verify fabric weave before composing the final prompt.",
-    "Canon note 0053: verify edge acuity before composing the final prompt.",
-    "Canon note 0054: verify motion blur vector before composing the final prompt.",
-    "Canon note 0055: verify background vanishing point before composing the final prompt.",
-    "Canon note 0056: verify reflected color cast before composing the final prompt.",
-    "Canon note 0057: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0058: verify compression block pattern before composing the final prompt.",
-    "Canon note 0059: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0060: verify scene scale cue before composing the final prompt.",
-    "Canon note 0061: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0062: verify visible text handling before composing the final prompt.",
-    "Canon note 0063: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0064: verify fine hair detail before composing the final prompt.",
-    "Canon note 0065: verify silhouette separation before composing the final prompt.",
-    "Canon note 0066: verify specular highlight map before composing the final prompt.",
-    "Canon note 0067: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0068: verify fabric weave before composing the final prompt.",
-    "Canon note 0069: verify edge acuity before composing the final prompt.",
-    "Canon note 0070: verify motion blur vector before composing the final prompt.",
-    "Canon note 0071: verify background vanishing point before composing the final prompt.",
-    "Canon note 0072: verify reflected color cast before composing the final prompt.",
-    "Canon note 0073: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0074: verify compression block pattern before composing the final prompt.",
-    "Canon note 0075: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0076: verify scene scale cue before composing the final prompt.",
-    "Canon note 0077: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0078: verify visible text handling before composing the final prompt.",
-    "Canon note 0079: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0080: verify fine hair detail before composing the final prompt.",
-    "Canon note 0081: verify silhouette separation before composing the final prompt.",
-    "Canon note 0082: verify specular highlight map before composing the final prompt.",
-    "Canon note 0083: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0084: verify fabric weave before composing the final prompt.",
-    "Canon note 0085: verify edge acuity before composing the final prompt.",
-    "Canon note 0086: verify motion blur vector before composing the final prompt.",
-    "Canon note 0087: verify background vanishing point before composing the final prompt.",
-    "Canon note 0088: verify reflected color cast before composing the final prompt.",
-    "Canon note 0089: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0090: verify compression block pattern before composing the final prompt.",
-    "Canon note 0091: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0092: verify scene scale cue before composing the final prompt.",
-    "Canon note 0093: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0094: verify visible text handling before composing the final prompt.",
-    "Canon note 0095: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0096: verify fine hair detail before composing the final prompt.",
-    "Canon note 0097: verify silhouette separation before composing the final prompt.",
-    "Canon note 0098: verify specular highlight map before composing the final prompt.",
-    "Canon note 0099: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0100: verify fabric weave before composing the final prompt.",
-    "Canon note 0101: verify edge acuity before composing the final prompt.",
-    "Canon note 0102: verify motion blur vector before composing the final prompt.",
-    "Canon note 0103: verify background vanishing point before composing the final prompt.",
-    "Canon note 0104: verify reflected color cast before composing the final prompt.",
-    "Canon note 0105: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0106: verify compression block pattern before composing the final prompt.",
-    "Canon note 0107: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0108: verify scene scale cue before composing the final prompt.",
-    "Canon note 0109: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0110: verify visible text handling before composing the final prompt.",
-    "Canon note 0111: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0112: verify fine hair detail before composing the final prompt.",
-    "Canon note 0113: verify silhouette separation before composing the final prompt.",
-    "Canon note 0114: verify specular highlight map before composing the final prompt.",
-    "Canon note 0115: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0116: verify fabric weave before composing the final prompt.",
-    "Canon note 0117: verify edge acuity before composing the final prompt.",
-    "Canon note 0118: verify motion blur vector before composing the final prompt.",
-    "Canon note 0119: verify background vanishing point before composing the final prompt.",
-    "Canon note 0120: verify reflected color cast before composing the final prompt.",
-    "Canon note 0121: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0122: verify compression block pattern before composing the final prompt.",
-    "Canon note 0123: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0124: verify scene scale cue before composing the final prompt.",
-    "Canon note 0125: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0126: verify visible text handling before composing the final prompt.",
-    "Canon note 0127: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0128: verify fine hair detail before composing the final prompt.",
-    "Canon note 0129: verify silhouette separation before composing the final prompt.",
-    "Canon note 0130: verify specular highlight map before composing the final prompt.",
-    "Canon note 0131: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0132: verify fabric weave before composing the final prompt.",
-    "Canon note 0133: verify edge acuity before composing the final prompt.",
-    "Canon note 0134: verify motion blur vector before composing the final prompt.",
-    "Canon note 0135: verify background vanishing point before composing the final prompt.",
-    "Canon note 0136: verify reflected color cast before composing the final prompt.",
-    "Canon note 0137: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0138: verify compression block pattern before composing the final prompt.",
-    "Canon note 0139: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0140: verify scene scale cue before composing the final prompt.",
-    "Canon note 0141: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0142: verify visible text handling before composing the final prompt.",
-    "Canon note 0143: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0144: verify fine hair detail before composing the final prompt.",
-    "Canon note 0145: verify silhouette separation before composing the final prompt.",
-    "Canon note 0146: verify specular highlight map before composing the final prompt.",
-    "Canon note 0147: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0148: verify fabric weave before composing the final prompt.",
-    "Canon note 0149: verify edge acuity before composing the final prompt.",
-    "Canon note 0150: verify motion blur vector before composing the final prompt.",
-    "Canon note 0151: verify background vanishing point before composing the final prompt.",
-    "Canon note 0152: verify reflected color cast before composing the final prompt.",
-    "Canon note 0153: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0154: verify compression block pattern before composing the final prompt.",
-    "Canon note 0155: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0156: verify scene scale cue before composing the final prompt.",
-    "Canon note 0157: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0158: verify visible text handling before composing the final prompt.",
-    "Canon note 0159: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0160: verify fine hair detail before composing the final prompt.",
-    "Canon note 0161: verify silhouette separation before composing the final prompt.",
-    "Canon note 0162: verify specular highlight map before composing the final prompt.",
-    "Canon note 0163: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0164: verify fabric weave before composing the final prompt.",
-    "Canon note 0165: verify edge acuity before composing the final prompt.",
-    "Canon note 0166: verify motion blur vector before composing the final prompt.",
-    "Canon note 0167: verify background vanishing point before composing the final prompt.",
-    "Canon note 0168: verify reflected color cast before composing the final prompt.",
-    "Canon note 0169: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0170: verify compression block pattern before composing the final prompt.",
-    "Canon note 0171: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0172: verify scene scale cue before composing the final prompt.",
-    "Canon note 0173: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0174: verify visible text handling before composing the final prompt.",
-    "Canon note 0175: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0176: verify fine hair detail before composing the final prompt.",
-    "Canon note 0177: verify silhouette separation before composing the final prompt.",
-    "Canon note 0178: verify specular highlight map before composing the final prompt.",
-    "Canon note 0179: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0180: verify fabric weave before composing the final prompt.",
-    "Canon note 0181: verify edge acuity before composing the final prompt.",
-    "Canon note 0182: verify motion blur vector before composing the final prompt.",
-    "Canon note 0183: verify background vanishing point before composing the final prompt.",
-    "Canon note 0184: verify reflected color cast before composing the final prompt.",
-    "Canon note 0185: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0186: verify compression block pattern before composing the final prompt.",
-    "Canon note 0187: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0188: verify scene scale cue before composing the final prompt.",
-    "Canon note 0189: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0190: verify visible text handling before composing the final prompt.",
-    "Canon note 0191: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0192: verify fine hair detail before composing the final prompt.",
-    "Canon note 0193: verify silhouette separation before composing the final prompt.",
-    "Canon note 0194: verify specular highlight map before composing the final prompt.",
-    "Canon note 0195: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0196: verify fabric weave before composing the final prompt.",
-    "Canon note 0197: verify edge acuity before composing the final prompt.",
-    "Canon note 0198: verify motion blur vector before composing the final prompt.",
-    "Canon note 0199: verify background vanishing point before composing the final prompt.",
-    "Canon note 0200: verify reflected color cast before composing the final prompt.",
-    "Canon note 0201: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0202: verify compression block pattern before composing the final prompt.",
-    "Canon note 0203: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0204: verify scene scale cue before composing the final prompt.",
-    "Canon note 0205: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0206: verify visible text handling before composing the final prompt.",
-    "Canon note 0207: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0208: verify fine hair detail before composing the final prompt.",
-    "Canon note 0209: verify silhouette separation before composing the final prompt.",
-    "Canon note 0210: verify specular highlight map before composing the final prompt.",
-    "Canon note 0211: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0212: verify fabric weave before composing the final prompt.",
-    "Canon note 0213: verify edge acuity before composing the final prompt.",
-    "Canon note 0214: verify motion blur vector before composing the final prompt.",
-    "Canon note 0215: verify background vanishing point before composing the final prompt.",
-    "Canon note 0216: verify reflected color cast before composing the final prompt.",
-    "Canon note 0217: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0218: verify compression block pattern before composing the final prompt.",
-    "Canon note 0219: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0220: verify scene scale cue before composing the final prompt.",
-    "Canon note 0221: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0222: verify visible text handling before composing the final prompt.",
-    "Canon note 0223: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0224: verify fine hair detail before composing the final prompt.",
-    "Canon note 0225: verify silhouette separation before composing the final prompt.",
-    "Canon note 0226: verify specular highlight map before composing the final prompt.",
-    "Canon note 0227: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0228: verify fabric weave before composing the final prompt.",
-    "Canon note 0229: verify edge acuity before composing the final prompt.",
-    "Canon note 0230: verify motion blur vector before composing the final prompt.",
-    "Canon note 0231: verify background vanishing point before composing the final prompt.",
-    "Canon note 0232: verify reflected color cast before composing the final prompt.",
-    "Canon note 0233: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0234: verify compression block pattern before composing the final prompt.",
-    "Canon note 0235: verify natural vs artificial light before composing the final prompt.",
-    "Canon note 0236: verify scene scale cue before composing the final prompt.",
-    "Canon note 0237: verify crop boundary intent before composing the final prompt.",
-    "Canon note 0238: verify visible text handling before composing the final prompt.",
-    "Canon note 0239: verify transparent object behavior before composing the final prompt.",
-    "Canon note 0240: verify fine hair detail before composing the final prompt.",
-    "Canon note 0241: verify silhouette separation before composing the final prompt.",
-    "Canon note 0242: verify specular highlight map before composing the final prompt.",
-    "Canon note 0243: verify skin-tone lighting bias before composing the final prompt.",
-    "Canon note 0244: verify fabric weave before composing the final prompt.",
-    "Canon note 0245: verify edge acuity before composing the final prompt.",
-    "Canon note 0246: verify motion blur vector before composing the final prompt.",
-    "Canon note 0247: verify background vanishing point before composing the final prompt.",
-    "Canon note 0248: verify reflected color cast before composing the final prompt.",
-    "Canon note 0249: verify ambient occlusion before composing the final prompt.",
-    "Canon note 0250: verify compression block pattern before composing the final prompt.",
+print("=" * 60)
+print(f"  LIBRARIES FOLDER : {LIB_ROOT}")
+print(f"  site-packages    : {SITE_PACKAGES}")
+print(f"  MEDIA FOLDER     : {MEDIA_ROOT}")
+print(f"  Admin            : {_is_admin()}")
+print("=" * 60)
+print("  Installing / verifying packages in C:\\AKT Media Tools only")
+print("=" * 60)
+
+for imp_name, pip_name in REQUIRED_PACKAGES.items():
+    if _package_present_in_target(imp_name, pip_name):
+        print(f"  [OK] {pip_name}")
+        continue
+    print(f"  [..] Installing {pip_name} -> {SITE_PACKAGES}")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--target", SITE_PACKAGES, pip_name]
+        )
+        importlib.invalidate_caches()
+        if _package_present_in_target(imp_name, pip_name):
+            print(f"  [INSTALLED] {pip_name}")
+        else:
+            print(f"  [WARN] pip finished but files not found for {pip_name}")
+    except Exception as e:
+        print(f"  [WARN] Failed {pip_name}: {e}")
+
+print("=" * 60)
+print(f"  Path: {SITE_PACKAGES}")
+print("=" * 60 + "\n")
+
+importlib.invalidate_caches()
+if SITE_PACKAGES in sys.path:
+    sys.path.remove(SITE_PACKAGES)
+sys.path.insert(0, SITE_PACKAGES)
+
+try:
+    from PIL import Image, UnidentifiedImageError
+except Exception as e:
+    print(f"  FATAL: Pillow import failed: {e}")
+    _pause_exit(1)
+
+try:
+    from google import genai
+except Exception as e:
+    print(f"  FATAL: google-genai import failed: {e}")
+    print(f'  Try: py -m pip install --upgrade --target "{SITE_PACKAGES}" google-genai Pillow')
+    _pause_exit(1)
+
+SCRIPT_DIR            = Path(MEDIA_ROOT)
+IMAGE_FOLDER          = SCRIPT_DIR / "Image to Prompt"
+DONE_FOLDER           = IMAGE_FOLDER / "Image to Prompt Done"
+OUTPUT_COMBINED_FILE  = IMAGE_FOLDER / "combined_image_output.txt"
+URL_PICKER_FILE       = SCRIPT_DIR / "Image to Prompt URL Picker.txt"
+URL_PICKER_FAILED     = SCRIPT_DIR / "Image to Prompt URL Picker Failed.txt"
+URL_PICKER_DONE       = SCRIPT_DIR / "Image to Prompt URL Picker Done.txt"
+JOB_LOG_FILE          = SCRIPT_DIR / "Image to Prompt Job Log.txt"
+
+VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
+
+# Ultimate Media Tool-style rename: "Image 1 originalname.jpg"
+_RE_DONE_NAME = re.compile(r"(?i)^Image(?:\s+No\.)?\s+(\d+)\s+")
+
+
+def _is_already_named_output(filename: str) -> bool:
+    """Skip files already renamed as Image N ... (or legacy Image No. N ...)."""
+    return bool(_RE_DONE_NAME.match(filename or ""))
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize like Ultimate Media Tool (Windows-illegal chars → _)."""
+    return re.sub(r'[<>:"/\\|?*]', "_", name or "image")
+
+REQUEST_DELAY_SEC     = 5
+MAX_RETRIES           = 4
+RETRY_BASE_DELAY      = 8
+MAX_IMAGE_PX          = 3072
+MAX_RUN_TIME_MIN      = 10
+PAUSE_TIME_MIN        = 10
+
+# Gemini model preference (2.5-flash is blocked for many new API keys → 404).
+# First working model is cached for the rest of the run.
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+_RESOLVED_GEMINI_MODEL: Optional[str] = None
+
+# Patterns that mean "this social URL will never work with our downloaders as-is"
+_PERMANENT_DL_HINTS = (
+    "no video formats found",
+    "unsupported url",
+    "unable to download webpage",
+    "private video",
+    "login required",
+    "requested content is not available",
+    "404",
 )
-@dataclasses.dataclass
-class GeminiApiKey:
-    index: int
-    user_id: str
-    api_key: str
-    requests_today: int = 0
-    request_timestamps: List[float] = dataclasses.field(default_factory=list)
-    last_used_at: float = 0.0
-    disabled_until: float = 0.0
-    consecutive_errors: int = 0
-
-    @property
-    def label(self) -> str:
-        return f"#{self.index} {self.user_id}"
 
 
-class GeminiApiKeyRotator:
-    """Rotate Gemini keys with 600s key switch delay, RPM 9/10, and RPD 249/250 limits."""
-
-    def __init__(
-        self,
-        keys: Sequence[GeminiApiKey],
-        key_switch_delay_seconds: int = KEY_SWITCH_DELAY_SECONDS,
-        rpm_soft_limit: int = RPM_SOFT_LIMIT,
-        rpm_hard_limit: int = RPM_HARD_LIMIT,
-        rpd_soft_limit: int = RPD_SOFT_LIMIT,
-        rpd_hard_limit: int = RPD_HARD_LIMIT,
-    ) -> None:
-        self.keys = list(keys)
-        self.key_switch_delay_seconds = key_switch_delay_seconds
-        self.rpm_soft_limit = rpm_soft_limit
-        self.rpm_hard_limit = rpm_hard_limit
-        self.rpd_soft_limit = rpd_soft_limit
-        self.rpd_hard_limit = rpd_hard_limit
-        self._lock = threading.RLock()
-        self._cursor = 0
-        self._day = _dt.date.today()
-
-    def _roll_day_if_needed(self) -> None:
-        today = _dt.date.today()
-        if today == self._day:
-            return
-        self._day = today
-        for key in self.keys:
-            key.requests_today = 0
-            key.request_timestamps.clear()
-            key.consecutive_errors = 0
-            key.disabled_until = 0.0
-
-    def _clean_recent(self, key: GeminiApiKey, now: Optional[float] = None) -> None:
-        if now is None:
-            now = time.time()
-        key.request_timestamps[:] = [t for t in key.request_timestamps if now - t < 60.0]
-
-    def _key_usable(self, key: GeminiApiKey, now: Optional[float] = None) -> Tuple[bool, str]:
-        if now is None:
-            now = time.time()
-        self._clean_recent(key, now)
-        if key.disabled_until > now:
-            return False, f"disabled for {int(key.disabled_until - now)}s"
-        if key.requests_today >= self.rpd_soft_limit:
-            return False, "daily soft quota reached"
-        if len(key.request_timestamps) >= self.rpm_soft_limit:
-            return False, "minute soft quota reached"
-        if key.last_used_at and now - key.last_used_at < self.key_switch_delay_seconds:
-            return False, f"switch delay {int(self.key_switch_delay_seconds - (now - key.last_used_at))}s"
-        return True, "ready"
-
-    def _least_wait_seconds(self, now: Optional[float] = None) -> float:
-        if now is None:
-            now = time.time()
-        waits: List[float] = []
-        for key in self.keys:
-            self._clean_recent(key, now)
-            if key.requests_today >= self.rpd_soft_limit:
-                continue
-            if key.disabled_until > now:
-                waits.append(key.disabled_until - now)
-            if key.request_timestamps:
-                waits.append(max(0.0, 60.0 - (now - min(key.request_timestamps))))
-            if key.last_used_at:
-                waits.append(max(0.0, self.key_switch_delay_seconds - (now - key.last_used_at)))
-        return min([w for w in waits if w > 0.0], default=30.0)
-
-    def wait_for_available_key(self) -> GeminiApiKey:
-        if not self.keys:
-            raise RuntimeError("No Gemini API keys configured. Fill USER_CONFIG with real keys before running.")
-        while True:
-            with self._lock:
-                self._roll_day_if_needed()
-                now = time.time()
-                for offset in range(len(self.keys)):
-                    pos = (self._cursor + offset) % len(self.keys)
-                    key = self.keys[pos]
-                    usable, _reason = self._key_usable(key, now)
-                    if usable:
-                        self._cursor = (pos + 1) % len(self.keys)
-                        return key
-                wait_s = min(max(self._least_wait_seconds(now), 1.0), 60.0)
-            print_step("~", f"All Gemini keys cooling down; waiting {int(wait_s)}s", C.YELLOW)
-            time.sleep(wait_s)
-
-    def record_success(self, key: GeminiApiKey) -> None:
-        now = time.time()
-        with self._lock:
-            self._roll_day_if_needed()
-            self._clean_recent(key, now)
-            key.request_timestamps.append(now)
-            key.requests_today += 1
-            key.last_used_at = now
-            key.consecutive_errors = 0
-
-    def mark_error(self, key: GeminiApiKey, error_text: str) -> None:
-        low = error_text.lower()
-        with self._lock:
-            key.consecutive_errors += 1
-            if any(token in low for token in ("quota", "resource_exhausted", "429", "rate limit")):
-                key.disabled_until = time.time() + 10 * 60
-            elif key.consecutive_errors >= 3:
-                key.disabled_until = time.time() + 3 * 60
-
-    def status_lines(self) -> List[str]:
-        now = time.time()
-        rows = []
-        with self._lock:
-            self._roll_day_if_needed()
-            for key in self.keys:
-                self._clean_recent(key, now)
-                usable, reason = self._key_usable(key, now)
-                rows.append(
-                    f"{key.label}: rpm={len(key.request_timestamps)}/{self.rpm_hard_limit} "
-                    f"rpd={key.requests_today}/{self.rpd_hard_limit} usable={usable} {reason}"
-                )
-        return rows
-
-
-def print_step(prefix: str, message: str, color: str = C.WHITE) -> None:
-    print(f"{color}[{prefix}] {message}{C.RESET}", flush=True)
-
-
-def parse_user_config(config_text: str = USER_CONFIG) -> List[GeminiApiKey]:
-    keys: List[GeminiApiKey] = []
-    pattern = re.compile(r"^\s*(\d+)\.\s*Enter Gemini API Key \(userID:\s*([^)]*?)\):\s*(\S+)\s*$")
-    placeholder_markers = (
-        "YOUR_GEMINI_API_KEY",
-        "YOUR_API_KEY",
-        "PASTE_GEMINI",
-        "PASTE_API_KEY",
-        "REPLACE_ME",
-        "EXAMPLE",
-        "<",
-        ">",
+def parse_user_config() -> List[Tuple[str, str, int]]:
+    text = USER_CONFIG or ""
+    keys: List[Tuple[str, str, int]] = []
+    seen = set()
+    pat_numbered = re.compile(
+        r"(?m)^\s*(\d+)\s*[\.\)]\s*"
+        r"(?:Enter\s+)?Gemini\s+API\s+Key"
+        r"(?:\s*\(\s*userID\s*:\s*([^)]+?)\s*\))?"
+        r"\s*:\s*"
+        r"(\S+)",
+        re.IGNORECASE,
     )
-    for raw_line in config_text.splitlines():
-        line = raw_line.strip()
-        if not line:
+    for m in pat_numbered.finditer(text):
+        slot = int(m.group(1))
+        uid = (m.group(2) or "").strip()
+        key = m.group(3).strip()
+        if not key:
             continue
-        match = pattern.match(line)
-        if not match:
+        placeholder_markers = (
+            "YOUR_GEMINI_API_KEY", "AIZA_XYZ", "AIZA_YOUR_KEY_HERE", "AIZA_XXX",
+            "PASTE", "XYZ", "YOUR_KEY", "REPLACE_ME",
+        )
+        up = key.upper()
+        if any(p in up for p in placeholder_markers):
             continue
-        index = int(match.group(1))
-        user_id = match.group(2).strip() or f"user_{index}"
-        api_key = match.group(3).strip()
-        if any(marker in api_key for marker in placeholder_markers):
+        if key.lower() in ("aiza_xyz", "aiza_your_key_here", "aiza_xxx"):
             continue
-        if api_key.upper().startswith("AQ.YOUR_"):
+        if len(key) < 20:
             continue
-        keys.append(GeminiApiKey(index=index, user_id=user_id, api_key=api_key))
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append((key, uid, slot))
+    if not keys:
+        raise RuntimeError(
+            "No valid Gemini API keys found in USER_CONFIG (top of script). "
+            "Replace the YOUR_GEMINI_API_KEY_* placeholders with real Gemini keys."
+        )
+    keys.sort(key=lambda t: t[2])
     return keys
 
 
-def banner() -> None:
-    print(f"{C.BOLD}{C.CYAN}{APP_TITLE}{C.RESET}")
-    print(f"{C.DIM}{APP_VERSION}{C.RESET}")
-    print("Download: direct image via urllib | Instagram via yt-dlp + browser cookies (Firefox→Chrome→…; MEDIA ONLY) then gallery-dl | other social via gallery-dl + yt-dlp")
-    print(f"Gemini keys: switch delay {KEY_SWITCH_DELAY_SECONDS}s, RPM {RPM_SOFT_LIMIT}/{RPM_HARD_LIMIT}, RPD {RPD_SOFT_LIMIT}/{RPD_HARD_LIMIT}")
+def is_overrides_empty(text: str) -> bool:
+    if not text:
+        return True
+    cleaned = text
+    cleaned = re.sub(r"Enter Gemini API Key\s*:.*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "", cleaned)
+    cleaned = re.sub(r"AQ\.[0-9A-Za-z_\-]{20,}", "", cleaned)
+    labels = [
+        r"Art Style", r"Body Rendering", r"Texture", r"Face",
+        r"Cloths?", r"Weapons", r"Any Other Information", r"Aspect Ratio", r"Movement",
+        r"What I Require\s*:", r"What I Don't Require\s*:",
+        r"What I Require", r"What I Don't Require",
+    ]
+    for lab in labels:
+        cleaned = re.sub(lab, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return len(cleaned) < 8
 
 
-def _ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def get_clean_overrides() -> str:
+    text = USER_THEMATIC_OVERRIDES or ""
+    text = re.sub(r"Enter Gemini API Key\s*:.*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "", text)
+    text = re.sub(r"AQ\.[0-9A-Za-z_\-]{20,}", "", text)
+    return text.strip()
 
 
-def _safe_slug(value: str, max_len: int = 96) -> str:
-    value = urllib.parse.unquote(value)
-    value = re.sub(r"https?://", "", value, flags=re.I)
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
-    return (value[:max_len] or "image")
+FORENSIC_SYSTEM_PROMPT = """
+You are a world-class forensic image analyst and elite AI prompt engineer.
+Your sole mission: produce a prompt so precise that a diffusion model (Midjourney v6,
+Stable Diffusion XL, FLUX) will reconstruct the original image with near-zero deviation.
+
+=== ABSOLUTE RULE — ZERO TEXT POLICY ===
+The source image may contain text, typography, watermarks, logos, subtitles, or
+numbers in ANY language. You MUST completely ignore all of it.
+Do NOT describe it, transcribe it, paraphrase it, or instruct the model to render any
+text whatsoever. Treat the entire image as if it never contained a single letter or digit.
+Any violation of this rule makes the entire output worthless.
+
+=== YOUR ANALYSIS PROTOCOL ===
+Examine the image with forensic precision across these 12 dimensions:
+
+1.  SUBJECT & ANATOMY
+    - Species, gender, age range, build, skin/fur/surface tone with specific descriptors
+      (e.g., "deep umber skin with visible muscle striations", not just "dark skin")
+    - Every visible garment: exact fabric drape, color, pattern, and physical state
+      (torn, pristine, wet, layered)
+    - Accessories, props, and weapons: their exact material (rusted iron, polished brass),
+      spatial position (held at waist height in right hand, pointing 30 degrees upward),
+      and physical condition
+
+2.  POSE & SPATIAL GEOMETRY
+    - Body orientation relative to camera (3/4 view, full frontal, profile)
+    - Limb angles — describe as clock positions or compass directions
+    - Weight distribution and centre of gravity (lunging forward, weight on left foot)
+    - Negative space usage (isolated figure vs. embedded in scene)
+
+3.  BACKGROUND & ENVIRONMENT
+    - Exact background color with descriptive specificity
+      (e.g., "flat muted cream, hex approximately #F0EAD6" rather than "beige")
+    - Background texture (smooth paper, canvas grain, vignette, gradient from bottom)
+    - Environmental elements (ground surface, sky, architectural details, props)
+    - Depth of field — is the background sharp, blurred, or completely flat/abstract?
+
+4.  ARTISTIC MEDIUM & EXECUTION
+    - Identify the exact medium with clinical precision:
+      * Photography: sensor size feel, lens focal length estimate, film stock or digital
+      * Illustration: vector, cel-shaded, ink wash, gouache, watercolor, airbrush
+      * Digital painting: brush types, rendering engine feel (Procreate, Photoshop)
+      * Mixed media: describe exactly which elements are which medium
+    - Line work: present or absent? Weight (hairline, medium, bold), consistency (uniform vs. tapered)
+    - Rendering style: flat shading, cell shading, painterly, hyper-realistic, impressionistic
+
+5.  TEXTURE & SURFACE IMPERFECTIONS
+    - Describe EVERY texture layer visible:
+      * Ink splatters (size, distribution, opacity)
+      * Grunge overlays (paper texture, rust, noise, film grain)
+      * Distressed edges, halftone dots, screen printing artifacts
+      * Brush stroke direction and visible bristle marks
+      * Digital noise, chromatic aberration, lens flare artifacts
+    - If the surface is perfectly clean and smooth, state that explicitly
+
+6.  LIGHTING ARCHITECTURE
+    - Number of light sources and their approximate positions (key light upper-right,
+      fill light lower-left, rim light behind)
+    - Light quality: hard (sharp shadows), soft (diffused, gradual falloff), or flat
+    - Shadow behavior: opacity, color of shadows (black, blue-tinted, warm), edge hardness
+    - Highlight behavior: specular spots, broad soft highlights, subsurface scattering
+    - Overall contrast level: low-key, high-key, high-contrast, flat
+
+7.  COLOR PALETTE — FORENSIC LEVEL
+    - List every dominant color as a descriptive + approximate hex code pairing
+      (e.g., "saffron orange: approximately #E8871A")
+    - Color temperature of the overall image (cool, warm, neutral)
+    - Saturation level (desaturated/muted, fully saturated, oversaturated)
+    - Color relationships: monochromatic, complementary, split-complementary, triadic
+    - Any color grading effects (sepia wash, cross-processing, teal-and-orange grade)
+
+8.  COMPOSITION & FRAMING
+    - Shot type: extreme close-up, close-up, medium, medium-wide, wide, extreme wide
+    - Camera angle: eye level, low angle, high angle, Dutch tilt, bird's eye, worm's eye
+    - Rule of thirds placement, golden ratio alignment, or dead-center placement
+    - Aspect ratio feel (square, landscape 16:9, portrait 4:5, panoramic)
+    - Any compositional tension, symmetry, or asymmetry
+
+9.  MOOD & ATMOSPHERE
+    - Emotional register: describe the feeling in 3-5 precise adjectives
+    - Time-of-day feel (if applicable): pre-dawn, golden hour, blue hour, midday
+    - Cultural or genre aesthetic (e.g., South Asian mythological epic, 1980s sci-fi,
+      Edo period Japan, Afrofuturism, Nordic noir)
+
+10. MOTION & DYNAMISM
+    - Static or dynamic? Describe implied motion direction and energy
+    - Motion blur, speed lines, or freeze-frame energy
+    - Particle effects: dust, sparks, smoke, rain, petals, energy beams
+
+11. RENDERING QUALITY DESCRIPTORS
+    - Identify the target quality tier for the reconstruction prompt:
+      (masterpiece, professional illustration, concept art, raw sketch, etc.)
+    - Any visible compression artifacts or intentional lo-fi aesthetics
+    - Resolution feel: sharp and crisp, soft-focus dream quality, gritty low-res
+
+12. NEGATIVE SPACE & INTENTIONAL OMISSIONS
+    - What is deliberately absent that defines the composition?
+    - Is the figure isolated? Is the background stripped to pure abstraction?
+
+=== OUTPUT FORMAT ===
+Return a single, valid JSON object. No markdown fences, no preamble, no explanation.
+Use this exact schema:
+
+{
+  "forensic_analysis": {
+    "subject_anatomy": "<detailed string>",
+    "pose_geometry": "<detailed string>",
+    "background_environment": "<detailed string>",
+    "artistic_medium": "<detailed string>",
+    "texture_imperfections": "<detailed string>",
+    "lighting_architecture": "<detailed string>",
+    "color_palette": "<detailed string>",
+    "composition_framing": "<detailed string>",
+    "mood_atmosphere": "<detailed string>",
+    "motion_dynamism": "<detailed string>",
+    "rendering_quality": "<detailed string>",
+    "negative_space": "<detailed string>"
+  },
+  "master_prompt": "<A single, dense, synthesized reconstruction prompt of 150-300 words that fuses ALL 12 dimensions above into one cohesive Midjourney/SD prompt. Must be purely visual. Must contain zero text instructions. Must include recommended aspect ratio and quality suffix flags at the end.>"
+}
+"""
 
 
-def _hash_file(path: Path, block_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(block_size)
-            if not chunk:
-                break
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    RED    = "\033[91m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    CYAN   = "\033[96m"
+    WHITE  = "\033[97m"
+    DIM    = "\033[2m"
+    BLUE   = "\033[94m"
+    MAGENTA= "\033[95m"
+
+
+def print_banner() -> None:
+    print(f"""
+{C.CYAN}{C.BOLD}
+ +----+
+ |   FORENSIC IMAGE-TO-PROMPT ENGINE  (ONE-CLICK)                 |
+ |   Libs: C:\\AKT Media Tools  |  Continuous Numbering            |
+ |   Gemini Flash (auto model) | Master + Forensic | Auto-Done + Dedup |
+ |   12-Key Rotation | Active 10 min / Pause 10 min loop          |
+ |   Sort: EXIF Date created FIRST (earliest first)               |
+ |   Key-switch delay: 600s | URL Picker + 8s Enter-URL prompt    |
+ |   Download: IG cookies+yt-dlp | gallery-dl + yt-dlp (1 thumb)  |
+ +----+
+{C.RESET}""")
+
+
+def print_step(icon: str, message: str, color: str = C.WHITE) -> None:
+    print(f"  {color}{icon}  {message}{C.RESET}")
+
+
+def print_progress(current: int, total: int, filename: str) -> None:
+    bar_width = 30
+    filled    = int(bar_width * current / max(total, 1))
+    bar       = "#" * filled + "-" * (bar_width - filled)
+    pct       = int(100 * current / max(total, 1))
+    print(f"\n  {C.CYAN}[{bar}] {pct:3d}%  ({current}/{total}){C.RESET}")
+    print(f"  {C.BOLD}Analyzing:{C.RESET} {C.YELLOW}{filename}{C.RESET}")
+
+
+def file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def _snapshot_files(folder: Path) -> Set[Path]:
-    if not folder.exists():
-        return set()
-    return {p.resolve() for p in folder.rglob("*") if p.is_file()}
+_EXIF_DATE_TAGS = (36867, 36868, 306)
+_EXIF_DATE_FORMATS = (
+    "%Y:%m:%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y:%m:%d %H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y:%m:%d",
+    "%Y-%m-%d",
+)
 
 
-def _is_valid_image(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size <= 0:
-        return False
-    suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_IMAGE_EXTS:
-        return False
-    if Image is not None:
+def _parse_exif_datetime(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
         try:
-            with Image.open(path) as img:  # type: ignore[union-attr]
-                img.verify()
-            return True
+            value = value.decode("utf-8", errors="ignore")
         except Exception:
-            return False
+            return None
+    if not isinstance(value, str):
+        value = str(value)
+    s = value.strip().strip("\x00").strip()
+    if not s:
+        return None
+    for fmt in _EXIF_DATE_FORMATS:
+        try:
+            core = s[:26].rstrip("Z")
+            clean_fmt = fmt.replace("%z", "").rstrip("Z") if "%z" not in fmt else fmt
+            dt = datetime.strptime(core, clean_fmt)
+            return dt.timestamp()
+        except Exception:
+            continue
+    m = re.match(
+        r"(\d{4})[:\-/.](\d{1,2})[:\-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?",
+        s,
+    )
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            hh = int(m.group(4) or 0)
+            mm = int(m.group(5) or 0)
+            ss = int(m.group(6) or 0)
+            return datetime(y, mo, d, hh, mm, ss).timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def _read_exif_date_created(path: Path) -> Tuple[Optional[float], str]:
     try:
-        return imghdr.what(path) is not None
+        with Image.open(path) as im:
+            try:
+                exif = im.getexif()
+            except Exception:
+                exif = None
+            if not exif:
+                return None, ""
+            ifd = None
+            try:
+                if hasattr(exif, "get_ifd"):
+                    ifd = exif.get_ifd(0x8769)
+            except Exception:
+                ifd = None
+            tag_labels = {
+                36867: "EXIF Date created (DateTimeOriginal)",
+                36868: "EXIF DateTimeDigitized",
+                306:   "EXIF DateTime",
+            }
+            for tag_id in _EXIF_DATE_TAGS:
+                raw = None
+                if ifd is not None and tag_id in (36867, 36868):
+                    try:
+                        raw = ifd.get(tag_id)
+                    except Exception:
+                        raw = None
+                if raw is None:
+                    try:
+                        raw = exif.get(tag_id)
+                    except Exception:
+                        raw = None
+                ts = _parse_exif_datetime(raw)
+                if ts is not None:
+                    return ts, tag_labels.get(tag_id, "EXIF")
     except Exception:
-        return suffix in DIRECT_IMAGE_EXTS
+        pass
+    return None, ""
 
 
-def _collect_new_valid_images(dest_folder: Path, before: Set[Path]) -> List[Path]:
-    found: List[Path] = []
-    if not dest_folder.exists():
-        return found
-    for path in sorted(dest_folder.rglob("*"), key=lambda p: (p.stat().st_mtime if p.exists() else 0, str(p))):
-        if not path.is_file():
+def _filesystem_date_created(path: Path) -> Tuple[Optional[float], str]:
+    try:
+        st = path.stat()
+        birth = getattr(st, "st_birthtime", None)
+        if birth is not None:
+            return float(birth), "File Date created (birthtime)"
+        return float(st.st_ctime), "File Date created"
+    except Exception:
+        return None, ""
+
+
+def get_image_sort_timestamp(path: Path) -> Tuple[float, str, str]:
+    name_key = path.name.lower()
+    ts, source = _read_exif_date_created(path)
+    if ts is not None:
+        return (ts, source, name_key)
+    ts, source = _filesystem_date_created(path)
+    if ts is not None:
+        return (ts, source, name_key)
+    try:
+        return (path.stat().st_mtime, "mtime", name_key)
+    except Exception:
+        return (0.0, "unknown", name_key)
+
+
+def format_ts(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "?"
+
+
+def find_all_images() -> List[Path]:
+    IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
+    found = []
+    seen_keys = set()
+    search_dirs = [IMAGE_FOLDER, SCRIPT_DIR]
+    print_step("~", "Scanning for images...", C.DIM)
+    for folder in search_dirs:
+        if not folder.exists():
             continue
         try:
-            resolved = path.resolve()
-        except Exception:
-            resolved = path
-        if resolved in before:
-            continue
-        if _is_valid_image(path):
-            found.append(path)
-    return found
+            for p in folder.iterdir():
+                if not p.is_file():
+                    continue
+                if _is_already_named_output(p.name):
+                    continue
+                ext = p.suffix.lower()
+                if ext in VALID_EXTENSIONS:
+                    key = (p.name.lower(), p.stat().st_size)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        found.append(p)
+                        loc = "Image to Prompt" if folder == IMAGE_FOLDER else "script folder"
+                        print(f"      {C.GREEN}Found:{C.RESET} {p.name}  ({loc})")
+        except Exception as e:
+            print_step("!", f"Scan error in {folder}: {e}", C.YELLOW)
+    print_step("~", "Sorting by EXIF Date created (earliest first)...", C.DIM)
+    keyed = []
+    for p in found:
+        ts, source, name_key = get_image_sort_timestamp(p)
+        keyed.append((ts, name_key, p, source))
+        print(f"      {C.DIM}{p.name}  →  {format_ts(ts)}  [{source}]{C.RESET}")
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    sorted_paths = [item[2] for item in keyed]
+    if sorted_paths:
+        print_step("+", f"Order locked: earliest Date created → latest ({len(sorted_paths)} image(s))", C.GREEN)
+    return sorted_paths
 
 
-def _module_available(module_name: str) -> bool:
-    if SITE_PACKAGES not in sys.path:
-        sys.path.insert(0, SITE_PACKAGES)
+def prepare_image(path: Path) -> Optional[Image.Image]:
     try:
-        __import__(module_name)
-        return True
-    except Exception:
-        return False
-
-
-def _pip_install(package_name: str) -> bool:
-    _ensure_dir(Path(SITE_PACKAGES))
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--target", SITE_PACKAGES, package_name]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if proc.returncode != 0:
-            print_step("!", f"pip install {package_name} failed: {(proc.stderr or proc.stdout).strip()[:400]}", C.YELLOW)
-            return False
-        return True
+        img = Image.open(path)
+        img.verify()
+        img = Image.open(path)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        elif img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        max_dim = max(img.size)
+        if max_dim > MAX_IMAGE_PX:
+            scale  = MAX_IMAGE_PX / max_dim
+            new_sz = (int(img.width * scale), int(img.height * scale))
+            img    = img.resize(new_sz, Image.Resampling.LANCZOS)
+        return img
     except Exception as exc:
-        print_step("!", f"pip install {package_name} failed: {exc}", C.YELLOW)
-        return False
+        print_step("!", f"Failed to prepare image {path.name}: {exc}", C.RED)
+        return None
 
 
-def _write_python_module_wrapper(path: Path, module_name: str) -> bool:
+def parse_gemini_json(raw_text: str) -> Optional[dict]:
+    text = raw_text.strip()
+    start = text.find("{")
+    end   = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        return None
     try:
-        _ensure_dir(path.parent)
-        body = (
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            f"site = {SITE_PACKAGES!r}\n"
-            "if site and site not in sys.path:\n"
-            "    sys.path.insert(0, site)\n"
-            f"from {module_name}.__main__ import main\n"
-            "raise SystemExit(main())\n"
+        return json.loads(text[start:end])
+    except Exception:
+        return None
+
+
+def _is_model_not_found_error(err_str: str) -> bool:
+    low = (err_str or "").lower()
+    return (
+        "404" in err_str
+        or "not_found" in low
+        or "no longer available" in low
+        or "is not found" in low
+        or "was not found" in low
+    ) and ("model" in low or "models/" in low)
+
+
+def _model_candidates() -> List[str]:
+    global _RESOLVED_GEMINI_MODEL
+    if _RESOLVED_GEMINI_MODEL:
+        rest = [m for m in GEMINI_MODEL_CANDIDATES if m != _RESOLVED_GEMINI_MODEL]
+        return [_RESOLVED_GEMINI_MODEL] + rest
+    return list(GEMINI_MODEL_CANDIDATES)
+
+
+def call_gemini_with_retry(rotator: "GeminiApiKeyRotator", img: Image.Image, filename: str) -> Optional[dict]:
+    global _RESOLVED_GEMINI_MODEL
+    delay = RETRY_BASE_DELAY
+    final_system_prompt = FORENSIC_SYSTEM_PROMPT
+    overrides_empty = is_overrides_empty(USER_THEMATIC_OVERRIDES)
+    clean_overrides = get_clean_overrides()
+
+    if overrides_empty:
+        print_step("~", "Overrides are blank → Pure original image mode (no style change)", C.CYAN)
+        pure_block = """
+=== PURE ORIGINAL MODE (NO USER OVERRIDES) ===
+The user has left all thematic overrides blank.
+You MUST describe and recreate the image EXACTLY as it appears.
+- Do NOT force any art style, ink, grunge, silhouette, abstract, or any other look.
+- Do NOT invent or change clothing, face, body, weapons, texture, or mood.
+- Stay 100% faithful to the real visual content, lighting, colors, composition and pose.
+This is a pure forensic reconstruction with zero creative manipulation.
+"""
+        final_system_prompt = final_system_prompt.replace(
+            "=== OUTPUT FORMAT ===",
+            pure_block + "\n=== OUTPUT FORMAT ==="
         )
-        path.write_text(body, encoding="utf-8")
-        path.chmod(0o755)
-        return True
-    except Exception as exc:
-        print_step("!", f"Could not write tool wrapper {path}: {exc}", C.YELLOW)
+    else:
+        print_step("~", "User overrides detected → Applying thematic instructions", C.YELLOW)
+        override_block = f"""
+=== USER THEMATIC OVERRIDES (HIGHEST PRIORITY) ===
+These instructions OVERRIDE the original image if they conflict.
+You MUST force both forensic_analysis and especially the master_prompt to obey them:
+
+"{clean_overrides}"
+
+"""
+        final_system_prompt = final_system_prompt.replace(
+            "=== OUTPUT FORMAT ===",
+            override_block + "=== OUTPUT FORMAT ==="
+        )
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        key, user_id, idx = rotator.get_current_key()
+        if idx == -1:
+            print_step("!", "All API keys exhausted / cooling down → waiting 60s before retry", C.YELLOW)
+            time.sleep(60)
+            continue
+        client = genai.Client(api_key=key)
+        last_err = ""
+        model_404_all = True
+        # Count one attempt against the key, not one per model fallback try
+        rotator.record_request(idx)
+        for model_name in _model_candidates():
+            try:
+                print_step(
+                    "~",
+                    f"Sending to {model_name}  (Key #{idx + 1} / {_mask_user_id(user_id or '')})...",
+                    C.DIM,
+                )
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[final_system_prompt, img],
+                )
+                if _RESOLVED_GEMINI_MODEL != model_name:
+                    _RESOLVED_GEMINI_MODEL = model_name
+                    print_step("+", f"Using Gemini model: {model_name}", C.GREEN)
+                raw = response.text.strip()
+                parsed = parse_gemini_json(raw)
+                if parsed and "master_prompt" in parsed:
+                    return parsed
+                return {
+                    "master_prompt": raw,
+                    "forensic_analysis": {},
+                    "_raw_fallback": True,
+                }
+            except Exception as exc:
+                err_str = str(exc)
+                last_err = err_str
+                low = err_str.lower()
+                if "429" in err_str or "quota" in low or "rate limit" in low or "resource_exhausted" in low:
+                    model_404_all = False
+                    retry_after = None
+                    m = re.search(r"retry(?:[-_ ]?after)?[^0-9]{0,20}(\d+)", low)
+                    if m:
+                        try:
+                            retry_after = float(m.group(1))
+                        except Exception:
+                            retry_after = None
+                    print_step("~", f"[{filename}] Attempt {attempt}: rate-limit/quota on Key #{idx + 1}", C.YELLOW)
+                    rotator.handle_rate_limit(idx, retry_after)
+                    break
+                if ("401" in err_str or "403" in err_str
+                        or "permission_denied" in low or "permission denied" in low
+                        or "unauthorized" in low or "api key not valid" in low
+                        or "api_key_invalid" in low or "invalid api key" in low):
+                    model_404_all = False
+                    print_step("~", f"[{filename}] Attempt {attempt}: auth error on Key #{idx + 1}", C.YELLOW)
+                    rotator.handle_auth_error(idx)
+                    break
+                if _is_model_not_found_error(err_str):
+                    print_step("~", f"Model {model_name} unavailable → trying next", C.YELLOW)
+                    continue
+                model_404_all = False
+                print_step("~", f"[{filename}] Attempt {attempt} failed: {err_str[:90]}... Retry in {delay}s", C.YELLOW)
+                time.sleep(delay)
+                delay *= 2
+                break
+        else:
+            # exhausted model list
+            if model_404_all:
+                print_step(
+                    "!",
+                    f"[{filename}] No usable Gemini model (tried {', '.join(GEMINI_MODEL_CANDIDATES)})",
+                    C.RED,
+                )
+                print_step("~", f"Last error: {last_err[:160]}", C.DIM)
+                # Do NOT disable the API key — this is a model-ID issue, not auth.
+                time.sleep(delay)
+                delay *= 2
+                continue
+    return None
+
+
+# ====
+# URL PICKER + DOWNLOAD (direct + gallery-dl + yt-dlp)
+# ====
+def ensure_url_picker_file() -> Path:
+    try:
+        if not URL_PICKER_FILE.exists():
+            URL_PICKER_FILE.write_text("", encoding="utf-8")
+            print_step("+", f"Created URL picker: {URL_PICKER_FILE.name}", C.GREEN)
+        else:
+            print_step("+", f"URL picker present: {URL_PICKER_FILE.name}", C.GREEN)
+    except Exception as e:
+        print_step("!", f"Could not ensure URL picker file: {e}", C.YELLOW)
+    return URL_PICKER_FILE
+
+
+def load_urls_from_picker() -> List[str]:
+    urls = []
+    seen = set()
+    try:
+        if not URL_PICKER_FILE.exists():
+            return []
+        text = URL_PICKER_FILE.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print_step("!", f"load_urls_from_picker: {e}", C.YELLOW)
+        return []
+    for m in re.finditer(r"https?://[^\s<>\"'\])\}]+", text, re.IGNORECASE):
+        u = m.group(0).rstrip(".,;:)")
+        if not u or u.lower() in seen:
+            continue
+        seen.add(u.lower())
+        urls.append(u)
+    return urls
+
+
+def remove_url_from_picker(url: str) -> bool:
+    """
+    Erase this URL from the active picker after the job finishes
+    (same pattern as Ultimate Media Tool URL Picker).
+    Remaining lines in the picker = unfinished balance.
+    """
+    if not url or not URL_PICKER_FILE.exists():
         return False
+    try:
+        text = URL_PICKER_FILE.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        new_lines = []
+        removed = False
+        url_norm = url.strip()
+        for line in lines:
+            if not removed and url_norm in line:
+                stripped = line.strip()
+                if stripped == url_norm or stripped.rstrip(".,;:)") == url_norm:
+                    removed = True
+                    continue
+                new_line = line.replace(url_norm, "", 1)
+                if new_line.strip():
+                    new_lines.append(new_line)
+                else:
+                    removed = True
+                    continue
+                removed = True
+            else:
+                new_lines.append(line)
+        if removed:
+            URL_PICKER_FILE.write_text("".join(new_lines), encoding="utf-8")
+            remaining = load_urls_from_picker()
+            print_step(
+                "+",
+                f"Erased completed URL from {URL_PICKER_FILE.name} "
+                f"(remaining balance: {len(remaining)} URL(s))",
+                C.GREEN,
+            )
+            return True
+    except Exception as e:
+        print_step("!", f"Could not remove URL from picker: {e}", C.YELLOW)
+    return False
 
 
-def _ensure_ytdlp() -> bool:
-    if YTDLP_PATH.exists():
-        return True
-    if _module_available("yt_dlp") or _pip_install("yt-dlp"):
-        return _write_python_module_wrapper(YTDLP_PATH, "yt_dlp")
-    return shutil.which("yt-dlp") is not None
+def archive_completed_url(url: str, note: str = "") -> None:
+    """Append completed URL to Done archive so you keep a permanent download record."""
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp}\t{url}"
+        if note:
+            line += f"\t# {note}"
+        line += "\n"
+        with open(URL_PICKER_DONE, "a", encoding="utf-8") as f:
+            f.write(line)
+        print_step("+", f"Recorded in {URL_PICKER_DONE.name}", C.GREEN)
+    except Exception as e:
+        print_step("!", f"Could not write Done URL archive: {e}", C.YELLOW)
 
 
-def _ensure_gallery_dl() -> bool:
-    if GALLERY_DL_PATH.exists():
-        return True
-    if _module_available("gallery_dl") or _pip_install("gallery-dl"):
-        return _write_python_module_wrapper(GALLERY_DL_PATH, "gallery_dl")
-    return shutil.which("gallery-dl") is not None
+def rotator_balance_plain(rotator: "GeminiApiKeyRotator") -> str:
+    """Plain-text key balance (RPM/RPD remaining) for job log — no ANSI colors."""
+    now = time.time()
+    lines = []
+    for k in rotator.keys:
+        rotator._refresh_windows(k)
+        rpm_left = max(0, rotator.ROTATE_AT_RPM - k["rpm_count"])
+        rpd_left = max(0, rotator.ROTATE_AT_RPD - k["rpd_count"])
+        if k["disabled"]:
+            status = "DISABLED"
+        elif k["cooldown_until"] > now:
+            status = f"COOLDOWN {int(k['cooldown_until'] - now)}s"
+        else:
+            status = "active"
+        lines.append(
+            f"  Key #{k['slot']} ({_mask_user_id(k['user_id'])}): "
+            f"RPM {k['rpm_count']}/{rotator.RPM_LIMIT} (left~{rpm_left}) | "
+            f"RPD {k['rpd_count']}/{rotator.RPD_LIMIT} (left~{rpd_left}) | {status}"
+        )
+    return "\n".join(lines)
 
 
-def _gallery_dl_cmd(url: str, dest_folder: Path) -> List[str]:
-    if _ensure_gallery_dl() and GALLERY_DL_PATH.exists():
-        return [str(GALLERY_DL_PATH), "-D", str(dest_folder), url]
-    exe = shutil.which("gallery-dl")
-    if exe:
-        return [exe, "-D", str(dest_folder), url]
-    return [sys.executable, "-m", "gallery_dl", "-D", str(dest_folder), url]
+def write_job_log(
+    *,
+    url: str,
+    downloaded_files: List[str],
+    processed_ok: List[str],
+    processed_fail: List[str],
+    success: int,
+    failed: int,
+    rotator: "GeminiApiKeyRotator",
+    status: str,
+) -> None:
+    """
+    Permanent job record: what was downloaded, what succeeded, URL picker balance,
+    and API key RPM/RPD balance after this job.
+    """
+    try:
+        remaining_urls = load_urls_from_picker()
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        block = []
+        block.append("=" * 80)
+        block.append(f"JOB COMPLETE  {stamp}")
+        block.append(f"Status       : {status}")
+        block.append(f"URL          : {url}")
+        block.append(f"Downloaded   : {len(downloaded_files)} file(s)")
+        for name in downloaded_files:
+            block.append(f"  + {name}")
+        block.append(f"Processed OK : {success}")
+        for name in processed_ok:
+            block.append(f"  + {name}")
+        block.append(f"Processed FAIL: {failed}")
+        for name in processed_fail:
+            block.append(f"  ! {name}")
+        block.append(f"URL picker remaining balance: {len(remaining_urls)} URL(s)")
+        for u in remaining_urls:
+            block.append(f"  ~ {u}")
+        block.append("API key balance after job:")
+        block.append(rotator_balance_plain(rotator))
+        block.append("")
+        with open(JOB_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(block) + "\n")
+        print_step("+", f"Job record saved → {JOB_LOG_FILE.name}", C.GREEN)
+    except Exception as e:
+        print_step("!", f"Could not write job log: {e}", C.YELLOW)
+
+
+def finish_url_job(
+    url: str,
+    saved_list: List[Path],
+    processed_ok: List[str],
+    processed_fail: List[str],
+    success: int,
+    failed: int,
+    rotator: "GeminiApiKeyRotator",
+) -> None:
+    """
+    After a picker URL job finishes (download + process):
+      1. Erase URL from active picker (remaining lines = unfinished balance)
+      2. Archive URL in Done.txt
+      3. Append full job record (files + key balance) to Job Log.txt
+    Matches Ultimate Media Tool: remove URL when the job for that URL completes.
+    """
+    downloaded = [p.name for p in saved_list]
+    if success > 0:
+        status = "OK" if failed == 0 else f"PARTIAL ({success} ok, {failed} fail)"
+        remove_url_from_picker(url)
+        archive_completed_url(
+            url,
+            note=f"{success} ok / {failed} fail / {len(downloaded)} downloaded",
+        )
+        write_job_log(
+            url=url,
+            downloaded_files=downloaded,
+            processed_ok=processed_ok,
+            processed_fail=processed_fail,
+            success=success,
+            failed=failed,
+            rotator=rotator,
+            status=status,
+        )
+    else:
+        print_step("!", "Processing failed — URL kept in picker for retry", C.YELLOW)
+        write_job_log(
+            url=url,
+            downloaded_files=downloaded,
+            processed_ok=processed_ok,
+            processed_fail=processed_fail,
+            success=success,
+            failed=failed,
+            rotator=rotator,
+            status="FAILED — URL kept in picker",
+        )
+
+
+def quarantine_url_as_failed(url: str, reason: str = "", rotator: Optional["GeminiApiKeyRotator"] = None) -> None:
+    """Move a permanently-failed URL out of the active picker so it won't retry forever."""
+    remove_url_from_picker(url)
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp}\t{url}"
+        if reason:
+            line += f"\t# {reason[:200]}"
+        line += "\n"
+        with open(URL_PICKER_FAILED, "a", encoding="utf-8") as f:
+            f.write(line)
+        print_step("~", f"URL moved to {URL_PICKER_FAILED.name} (no infinite retry)", C.YELLOW)
+    except Exception as e:
+        print_step("!", f"Could not write failed-URL log: {e}", C.YELLOW)
+    if rotator is not None:
+        write_job_log(
+            url=url,
+            downloaded_files=[],
+            processed_ok=[],
+            processed_fail=[],
+            success=0,
+            failed=0,
+            rotator=rotator,
+            status=f"QUARANTINED — {reason}",
+        )
 
 
 def _looks_permanent_download_error(log_text: str) -> bool:
-    low = log_text.lower()
-    permanent_markers = (
-        "404 not found",
-        "not found",
-        "does not exist",
-        "private",
-        "login required",
-        "permission denied",
-        "forbidden",
-        "unavailable",
-        "no longer available",
-        "unsupported url",
-        "unsupported site",
-        "age-restricted",
+    low = (log_text or "").lower()
+    return any(h in low for h in _PERMANENT_DL_HINTS)
+
+
+def _ensure_ytdlp() -> bool:
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    if YTDLP_PATH.exists() and YTDLP_PATH.stat().st_size > 100_000:
+        return True
+    print_step("~", f"Downloading yt-dlp.exe ({YTDLP_RELEASE_TAG}) → Tools ...", C.YELLOW)
+    try:
+        req = urllib.request.Request(
+            YTDLP_DOWNLOAD_URL,
+            headers={"User-Agent": "Mozilla/5.0 (ImageToPrompt/1.1)"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp, open(YTDLP_PATH, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        if YTDLP_PATH.exists() and YTDLP_PATH.stat().st_size > 100_000:
+            print_step("+", f"yt-dlp ready: {YTDLP_PATH}", C.GREEN)
+            return True
+    except Exception as e:
+        print_step("!", f"yt-dlp download failed: {e}", C.RED)
+        # Fallback to latest if pinned tag 404s
+        try:
+            latest = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+            req = urllib.request.Request(latest, headers={"User-Agent": "Mozilla/5.0 (ImageToPrompt/1.1)"})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(YTDLP_PATH, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            if YTDLP_PATH.exists() and YTDLP_PATH.stat().st_size > 100_000:
+                print_step("+", f"yt-dlp ready (latest): {YTDLP_PATH}", C.GREEN)
+                return True
+        except Exception as e2:
+            print_step("!", f"yt-dlp latest fallback failed: {e2}", C.RED)
+    return False
+
+
+def _is_direct_image_url(url: str) -> bool:
+    path = url.split("?")[0].split("#")[0].rstrip("/").lower()
+    return any(path.endswith(ext) for ext in VALID_EXTENSIONS)
+
+
+def _is_social_media_url(url: str) -> bool:
+    low = url.lower()
+    hosts = (
+        "instagram.com", "instagr.am",
+        "twitter.com", "x.com",
+        "facebook.com", "fb.watch",
+        "tiktok.com", "youtube.com", "youtu.be",
+        "reddit.com", "pinterest.com", "threads.net",
     )
-    transient_markers = (
-        "timed out",
-        "timeout",
-        "temporary failure",
-        "connection reset",
-        "connection aborted",
-        "429",
-        "too many requests",
-        "rate limit",
-    )
-    if any(marker in low for marker in transient_markers):
-        return False
-    return any(marker in low for marker in permanent_markers)
+    return any(h in low for h in hosts)
 
 
 def _is_instagram_url(url: str) -> bool:
-    host = urllib.parse.urlparse(url).netloc.lower()
-    return host.endswith("instagram.com") or host.endswith("instagr.am")
+    low = url.lower()
+    return "instagram.com" in low or "instagr.am" in low
 
 
-def _is_probably_direct_image_url(url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    suffix = Path(parsed.path).suffix.lower()
-    if suffix in DIRECT_IMAGE_EXTS:
-        return True
-    ctype, _ = mimetypes.guess_type(parsed.path)
-    return bool(ctype and ctype.startswith("image/"))
-
-
-def download_direct_image(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
-    dest_folder.mkdir(parents=True, exist_ok=True)
-    before = _snapshot_files(dest_folder)
-    parsed = urllib.parse.urlparse(url)
-    name = Path(parsed.path).name or f"download_{int(time.time())}.jpg"
-    if not Path(name).suffix:
-        name += ".jpg"
-    target = dest_folder / _safe_slug(name, max_len=120)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-    }
+def _snapshot_files(dest_folder: Path) -> Dict[str, Tuple[int, int]]:
+    """Relative-path → (mtime_ns, size) snapshot of all files under dest_folder."""
+    snap: Dict[str, Tuple[int, int]] = {}
     try:
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=45) as response:
-            content_type = response.headers.get("Content-Type", "")
-            data = response.read()
-        if not data:
-            return [], "urllib downloaded zero bytes"
-        if "image" not in content_type.lower() and not _is_probably_direct_image_url(url):
-            return [], f"urllib response was not image content: {content_type}"
-        target.write_bytes(data)
-        images = _collect_new_valid_images(dest_folder, before)
-        if images:
-            print_step("+", f"Saved direct image → {images[0].name}", C.GREEN)
-        return images, f"urllib saved {target} ({len(data)} bytes; {content_type})"
-    except Exception as exc:
-        return [], f"urllib direct image failed: {exc}"
+        for p in dest_folder.rglob("*"):
+            if p.is_file():
+                rel = str(p.relative_to(dest_folder)).replace("\\", "/").lower()
+                try:
+                    st = p.stat()
+                    snap[rel] = (st.st_mtime_ns, st.st_size)
+                except Exception:
+                    snap[rel] = (0, 0)
+    except Exception:
+        pass
+    return snap
+
+
+def _thumbnail_group_key(path: Path) -> str:
+    """
+    Group yt-dlp multi-quality thumbnails of the same carousel slide.
+    e.g. 'DbYGxpiCXHs_1_Video by parasmadan.in.0.jpg'
+      →  'DbYGxpiCXHs_1_Video by parasmadan.in'
+    """
+    name = path.name
+    # Strip trailing .N before extension (thumbnail quality index 0..N)
+    m = re.match(r"^(.*)\.(\d+)(\.[^.]+)$", name)
+    if m:
+        return m.group(1).lower()
+    return path.stem.lower()
+
+
+def _dedupe_thumbnail_variants(images: List[Path]) -> List[Path]:
+    """
+    Keep ONE best still per carousel slide (largest file). Delete the rest.
+    Prevents 8 slides × 13 thumbnail sizes = 104 junk images.
+    """
+    if not images:
+        return []
+    groups: Dict[str, List[Path]] = {}
+    for p in images:
+        groups.setdefault(_thumbnail_group_key(p), []).append(p)
+
+    kept: List[Path] = []
+    removed = 0
+    for key, paths in groups.items():
+        if len(paths) == 1:
+            kept.append(paths[0])
+            continue
+        # Prefer largest bytes (usually highest-res Instagram thumbnail)
+        paths_sorted = sorted(
+            paths,
+            key=lambda x: (x.stat().st_size if x.exists() else 0, x.name),
+            reverse=True,
+        )
+        best = paths_sorted[0]
+        kept.append(best)
+        for junk in paths_sorted[1:]:
+            try:
+                junk.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        print_step("~", f"Kept 1 thumbnail per slide — removed {removed} lower-res variant(s)", C.CYAN)
+    kept.sort(key=lambda x: x.name.lower())
+    return kept
+
+
+def _collect_new_valid_images(dest_folder: Path, before_meta: Dict[str, Tuple[int, int]]) -> List[Path]:
+    """Return new OR updated valid still images under dest_folder, flattened + deduped."""
+    found: List[Path] = []
+    try:
+        for p in dest_folder.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(dest_folder)).replace("\\", "/").lower()
+            try:
+                st = p.stat()
+                meta = (st.st_mtime_ns, st.st_size)
+            except Exception:
+                continue
+            prev = before_meta.get(rel)
+            if prev is not None and prev == meta:
+                continue  # unchanged
+            if p.suffix.lower() not in VALID_EXTENSIONS:
+                continue
+            try:
+                with Image.open(p) as im:
+                    im.verify()
+                found.append(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Flatten nested gallery-dl downloads into IMAGE_FOLDER for consistent processing
+    flattened: List[Path] = []
+    for p in found:
+        if p.parent == dest_folder:
+            flattened.append(p)
+            continue
+        target = dest_folder / p.name
+        n = 1
+        while target.exists() and target.resolve() != p.resolve():
+            target = dest_folder / f"{p.stem}_{n}{p.suffix}"
+            n += 1
+        if target.resolve() != p.resolve():
+            try:
+                shutil.move(str(p), str(target))
+                flattened.append(target)
+            except Exception:
+                flattened.append(p)
+        else:
+            flattened.append(p)
+
+    return _dedupe_thumbnail_variants(flattened)
+
+
+def _gallery_dl_available() -> bool:
+    return _package_present_in_target("gallery_dl", "gallery-dl")
 
 
 BROWSERS = ["firefox", "chrome", "edge", "brave", "opera", "chromium", "vivaldi"]
 
 
 def _ytdlp_bin() -> Optional[str]:
+    """Prefer bundled yt-dlp.exe; fall back to python -m yt_dlp."""
     if _ensure_ytdlp() and YTDLP_PATH.exists():
         return str(YTDLP_PATH)
     return None
 
 
 def _instagram_ytdlp_base_cmd(url: str, out_tmpl: str) -> List[str]:
+    """MEDIA-ONLY Instagram yt-dlp command (archiver logic)."""
     ytdlp = _ytdlp_bin()
     if ytdlp:
         head = [ytdlp, url, "-o", out_tmpl]
@@ -1862,14 +1641,16 @@ def _instagram_ytdlp_base_cmd(url: str, out_tmpl: str) -> List[str]:
 
 def download_via_instagram_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
     """
-    Instagram download (archiver logic):
-      Cookie auth: Firefox → Chrome → Edge → Brave → Opera → Chromium → Vivaldi
+    Instagram download (ULTIMATE INSTAGRAM ARCHIVER logic):
+      Cookie auth order: Firefox → Chrome → Edge → Brave → Opera → Chromium → Vivaldi
       Then public (no cookies).
-      MEDIA ONLY. Success = new valid still images via _collect_new_valid_images.
+      Mode: MEDIA ONLY (no JSON / no thumbnails).
+    Success = new valid still images via _collect_new_valid_images.
     """
     dest_folder.mkdir(parents=True, exist_ok=True)
     if _ytdlp_bin() is None:
         return [], "yt-dlp not available"
+
     out_tmpl = str(
         dest_folder / "%(id)s_%(playlist_index|)s%(playlist_index&_)s%(title).80B.%(ext)s"
     )
@@ -1898,10 +1679,13 @@ def download_via_instagram_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path
             out = (proc.stdout or "") + "\n" + (proc.stderr or "")
             for line in out.splitlines():
                 low = line.lower()
-                if any(x in low for x in (
-                    "download", "100%", "error", "destination", "writing",
-                    "merging", "cookie", "extract", "warning",
-                )):
+                if any(
+                    x in low
+                    for x in (
+                        "download", "100%", "error", "destination", "writing",
+                        "merging", "cookie", "extract", "warning",
+                    )
+                ):
                     print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
             return out
         except subprocess.TimeoutExpired:
@@ -1935,27 +1719,32 @@ def download_via_instagram_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path
         return images, "\n".join(combined_log)
 
     print_step("!", "Instagram yt-dlp finished but no new still image in folder", C.YELLOW)
-    print_step("!", "FIX: Firefox → instagram.com → log in → CLOSE Firefox → re-run", C.YELLOW)
+    print_step(
+        "!",
+        "FIX: Firefox → instagram.com → log in → CLOSE Firefox → re-run",
+        C.YELLOW,
+    )
     return [], "\n".join(combined_log)
 
 
 def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
+    """
+    Best path for Instagram photo / carousel posts.
+    Returns (images, combined_log).
+    """
+    if not _gallery_dl_available():
+        return [], "gallery-dl not installed"
     dest_folder.mkdir(parents=True, exist_ok=True)
-    if not _ensure_gallery_dl():
-        return [], "gallery-dl not available"
     before = _snapshot_files(dest_folder)
-    env = {
-        **os.environ,
-        "PYTHONPATH": SITE_PACKAGES + os.pathsep + os.environ.get("PYTHONPATH", ""),
-    }
-    cmd = _gallery_dl_cmd(url, dest_folder) + [
-        "--no-part",
-        "--no-skip",
-        "--write-metadata",
-        "--write-tags",
-        "--write-info-json",
+    cmd = [
+        sys.executable, "-m", "gallery_dl",
+        "--dest", str(dest_folder),
+        "-f", "{id}_{num}.{extension}",
+        "--filter", "extension in ('jpg','jpeg','png','webp','gif')",
+        url,
     ]
-    print_step("~", f"gallery-dl: {url[:90]}...", C.DIM)
+    print_step("~", f"gallery-dl downloading images: {url[:80]}...", C.DIM)
+    log = ""
     try:
         proc = subprocess.run(
             cmd,
@@ -1963,87 +1752,189 @@ def download_via_gallery_dl(url: str, dest_folder: Path) -> Tuple[List[Path], st
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=600,
+            timeout=240,
             cwd=str(dest_folder),
-            env=env,
+            env={**os.environ, "PYTHONPATH": SITE_PACKAGES + os.pathsep + os.environ.get("PYTHONPATH", "")},
         )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        for line in out.splitlines():
+        log = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        for line in log.splitlines():
             low = line.lower()
-            if any(token in low for token in ("download", "error", "warning", "skip", "extract", "http")):
+            if any(x in low for x in ("download", "error", "#", "http", "writing")):
                 print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
         images = _collect_new_valid_images(dest_folder, before)
-        for p in images:
-            print_step("+", f"Saved via gallery-dl → {p.name}", C.GREEN)
-        return images, out
+        if images:
+            for p in images:
+                print_step("+", f"Saved via gallery-dl → {p.name}", C.GREEN)
+            return images, log
+        return [], log
     except subprocess.TimeoutExpired:
-        return [], "gallery-dl timed out (600s)"
-    except Exception as exc:
-        return [], f"gallery-dl failed: {exc}"
+        return [], "gallery-dl timed out (240s)"
+    except Exception as e:
+        return [], f"gallery-dl failed: {e}"
 
 
 def download_via_ytdlp(url: str, dest_folder: Path) -> Tuple[List[Path], str]:
-    dest_folder.mkdir(parents=True, exist_ok=True)
+    """
+    Social download via yt-dlp.
+    For Instagram image-only / carousel posts: write thumbnails + ignore missing video formats.
+    Returns (images, combined_log).
+    """
     if not _ensure_ytdlp():
+        print_step("!", "yt-dlp not available — cannot download social media posts", C.RED)
         return [], "yt-dlp not available"
+    dest_folder.mkdir(parents=True, exist_ok=True)
     before = _snapshot_files(dest_folder)
-    ytdlp = str(YTDLP_PATH) if YTDLP_PATH.exists() else (shutil.which("yt-dlp") or sys.executable)
-    if ytdlp == sys.executable:
-        cmd = [sys.executable, "-m", "yt_dlp", url]
-    else:
-        cmd = [ytdlp, url]
-    out_tmpl = str(dest_folder / "%(id)s_%(title).80B.%(ext)s")
-    cmd += [
+    out_tmpl = str(dest_folder / "%(id)s_%(playlist_index|)s%(playlist_index&_)s%(title).60B.%(ext)s")
+
+    # Pass 1: media download + ONE thumbnail per item (not all quality variants)
+    # Do NOT use --no-playlist — Instagram carousels must keep all items
+    # Do NOT use --write-all-thumbnails — that creates 10+ junk sizes per slide
+    cmd_media = [
+        str(YTDLP_PATH),
+        url,
         "-o", out_tmpl,
-        "--skip-download",
+        "--no-mtime",
+        "--ignore-no-formats-error",
         "--write-thumbnail",
         "--convert-thumbnails", "jpg",
-        "--ignore-errors",
-        "--no-warnings",
         "--retries", "3",
     ]
-    env = {
-        **os.environ,
-        "PYTHONPATH": SITE_PACKAGES + os.pathsep + os.environ.get("PYTHONPATH", ""),
-    }
-    print_step("~", f"yt-dlp thumbnail path: {url[:90]}...", C.DIM)
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
-            cwd=str(dest_folder),
-            env=env,
-        )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        for line in out.splitlines():
-            low = line.lower()
-            if any(token in low for token in ("download", "thumbnail", "error", "warning", "destination")):
-                print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
-        images = _collect_new_valid_images(dest_folder, before)
+    # Pass 2 (image-only fallback): skip media, only one thumbnail per item
+    cmd_thumbs = [
+        str(YTDLP_PATH),
+        url,
+        "-o", out_tmpl,
+        "--no-mtime",
+        "--skip-download",
+        "--ignore-no-formats-error",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "--retries", "3",
+    ]
+
+    combined_log = ""
+
+    def _run(cmd: List[str], label: str) -> str:
+        print_step("~", f"yt-dlp [{label}]: {url[:80]}...", C.DIM)
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            for line in out.splitlines():
+                low = line.lower()
+                if any(x in low for x in ("download", "100%", "error", "destination", "writing", "thumbnail")):
+                    print(f"      {C.DIM}{line.strip()[:120]}{C.RESET}")
+            return out
+        except subprocess.TimeoutExpired:
+            print_step("!", f"yt-dlp [{label}] timed out (180s)", C.RED)
+            return f"yt-dlp [{label}] timed out"
+        except Exception as e:
+            print_step("!", f"yt-dlp [{label}] failed: {e}", C.RED)
+            return f"yt-dlp [{label}] failed: {e}"
+
+    combined_log += _run(cmd_media, "media+thumbs")
+    images = _collect_new_valid_images(dest_folder, before)
+    if images:
         for p in images:
-            print_step("+", f"Saved via yt-dlp thumbnail path → {p.name}", C.GREEN)
-        return images, out
-    except subprocess.TimeoutExpired:
-        return [], "yt-dlp thumbnail path timed out (600s)"
-    except Exception as exc:
-        return [], f"yt-dlp thumbnail path failed: {exc}"
+            print_step("+", f"Saved via yt-dlp → {p.name}", C.GREEN)
+        return images, combined_log
+
+    # Image-only Instagram posts often need skip-download + thumbnails
+    if _is_instagram_url(url) or "no video formats found" in combined_log.lower():
+        before2 = _snapshot_files(dest_folder)
+        combined_log += "\n" + _run(cmd_thumbs, "thumbs-only")
+        images = _collect_new_valid_images(dest_folder, before2)
+        if images:
+            for p in images:
+                print_step("+", f"Saved via yt-dlp thumbnail → {p.name}", C.GREEN)
+            return images, combined_log
+
+    print_step("!", "yt-dlp finished but no new still image in folder", C.YELLOW)
+    err_tail = combined_log[-400:] if combined_log else ""
+    if err_tail.strip():
+        print(f"      {C.DIM}{err_tail.strip()[:300]}{C.RESET}")
+    return [], combined_log
 
 
 def download_image_from_url(url: str, dest_folder: Path) -> Tuple[List[Path], str, bool]:
+    """
+    Smart download:
+      1. Direct image URL → urllib
+      2. Instagram → yt-dlp browser cookies (Firefox first; MEDIA ONLY), then gallery-dl, then yt-dlp thumbs
+      3. Pinterest/Reddit → gallery-dl first, then yt-dlp
+      4. Other social → yt-dlp, then gallery-dl
+    Returns: (images, log, permanent_failure_hint)
+    """
+    dest_folder.mkdir(parents=True, exist_ok=True)
     logs: List[str] = []
-    url = url.strip()
-    if not url:
-        return [], "empty URL", True
+    permanent = False
 
-    if _is_probably_direct_image_url(url):
-        imgs, log = download_direct_image(url, dest_folder)
-        logs.append(log)
-        if imgs:
-            return imgs, "\n".join(logs), False
+    if _is_direct_image_url(url) or not _is_social_media_url(url):
+        path_part = url.split("?")[0].rstrip("/")
+        ext = Path(path_part).suffix.lower()
+        if ext not in VALID_EXTENSIONS:
+            ext = ".jpg"
+        stem = re.sub(r"[^\w\-]+", "_", Path(path_part).stem)[:80] or "downloaded_image"
+        dest = dest_folder / f"{stem}{ext}"
+        n = 1
+        while dest.exists():
+            dest = dest_folder / f"{stem}_{n}{ext}"
+            n += 1
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": url,
+        }
+        print_step("~", f"Downloading (direct): {url[:100]}...", C.DIM)
+        for attempt in range(1, 3):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                # Keep SSL verification ON (do not disable)
+                with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+                if not dest.exists() or dest.stat().st_size < 100:
+                    try:
+                        dest.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    with Image.open(dest) as im:
+                        im.verify()
+                    print_step("+", f"Saved → {dest.name} ({dest.stat().st_size} bytes)", C.GREEN)
+                    return [dest], "direct ok", False
+                except Exception:
+                    print_step("!", f"Not a valid image: {dest.name}", C.YELLOW)
+                    try:
+                        dest.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                msg = f"Direct download attempt {attempt}: {e}"
+                print_step("!", msg, C.YELLOW)
+                logs.append(msg)
+                try:
+                    if dest.exists():
+                        dest.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        if _is_direct_image_url(url):
+            return [], "\n".join(logs), _looks_permanent_download_error("\n".join(logs))
+        if not _is_social_media_url(url):
+            print_step("~", "Direct failed — trying social downloaders...", C.DIM)
 
     # ---- Instagram: archiver cookie / media-only logic ----
     if _is_instagram_url(url):
@@ -2056,7 +1947,6 @@ def download_image_from_url(url: str, dest_folder: Path) -> Tuple[List[Path], st
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
-        # last resort: existing yt-dlp thumbs path
         print_step("~", "gallery-dl produced no images — trying yt-dlp thumbnail path...", C.DIM)
         imgs, log = download_via_ytdlp(url, dest_folder)
         logs.append(log)
@@ -2079,455 +1969,390 @@ def download_image_from_url(url: str, dest_folder: Path) -> Tuple[List[Path], st
         permanent = _looks_permanent_download_error("\n".join(logs))
         return [], "\n".join(logs), permanent
 
-    host = urllib.parse.urlparse(url).netloc.lower()
-    if any(host.endswith(domain) for domain in SOCIAL_DOMAINS):
-        imgs, log = download_via_gallery_dl(url, dest_folder)
-        logs.append(log)
-        if imgs:
-            return imgs, "\n".join(logs), False
+    if _is_social_media_url(url):
         imgs, log = download_via_ytdlp(url, dest_folder)
         logs.append(log)
         if imgs:
             return imgs, "\n".join(logs), False
+        # Secondary: gallery-dl for other hosts it supports
+        imgs, log = download_via_gallery_dl(url, dest_folder)
+        logs.append(log)
+        if imgs:
+            return imgs, "\n".join(logs), False
+        permanent = _looks_permanent_download_error("\n".join(logs))
+        return [], "\n".join(logs), permanent
 
-    imgs, log = download_direct_image(url, dest_folder)
-    logs.append(log)
-    permanent = _looks_permanent_download_error("\n".join(logs))
-    return imgs, "\n".join(logs), permanent
-
-
-def _load_google_genai(api_key: str) -> Any:
-    if SITE_PACKAGES not in sys.path:
-        sys.path.insert(0, SITE_PACKAGES)
-    try:
-        import google.generativeai as genai  # type: ignore
-    except Exception:
-        if not _pip_install("google-generativeai"):
-            raise
-        import google.generativeai as genai  # type: ignore
-    genai.configure(api_key=api_key)
-    return genai
+    return [], "\n".join(logs), False
 
 
-def _image_mime_type(path: Path) -> str:
-    ctype, _ = mimetypes.guess_type(str(path))
-    if ctype and ctype.startswith("image/"):
-        return ctype
-    return "image/jpeg"
-
-
-def _read_image_part(path: Path) -> Dict[str, Any]:
-    data = path.read_bytes()
-    return {"mime_type": _image_mime_type(path), "data": data}
-
-
-def _build_user_prompt(path: Path, theme: Optional[str] = None, source_url: Optional[str] = None) -> str:
-    theme_text = ""
-    if theme:
-        theme_text = USER_THEMATIC_OVERRIDES.get(theme, theme)
-    source_text = f"\nSource URL: {source_url}" if source_url else ""
-    return textwrap.dedent(
-        f"""
-        Analyze the attached image as forensic visual evidence and produce the requested image-to-prompt output.
-        File name: {path.name}{source_text}
-        Optional user thematic override: {theme_text or 'none'}
-
-        Preserve the scene faithfully. If a detail is uncertain, state it as uncertain rather than inventing it.
-        """
-    ).strip()
-
-
-def _is_retryable_gemini_error(text: str) -> bool:
-    low = text.lower()
-    return any(token in low for token in ("timeout", "temporarily", "overloaded", "unavailable", "429", "quota", "rate", "resource_exhausted"))
-
-
-def _extract_response_text(response: Any) -> str:
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    parts: List[str] = []
-    try:
-        for candidate in getattr(response, "candidates", []) or []:
-            content = getattr(candidate, "content", None)
-            for part in getattr(content, "parts", []) or []:
-                value = getattr(part, "text", None)
-                if value:
-                    parts.append(str(value))
-    except Exception:
-        pass
-    return "\n".join(parts).strip()
-
-
-def call_gemini_with_retry(
-    image_path: Path,
-    rotator: GeminiApiKeyRotator,
-    theme: Optional[str] = None,
-    source_url: Optional[str] = None,
-    max_attempts_per_model: int = 2,
-) -> Tuple[str, str, str]:
-    last_error = ""
-    for model_name in MODEL_FALLBACK_ORDER:
-        for attempt in range(1, max_attempts_per_model + 1):
-            key = rotator.wait_for_available_key()
-            print_step("~", f"Gemini {model_name} attempt {attempt} using {key.label}", C.CYAN)
-            try:
-                genai = _load_google_genai(key.api_key)
-                generation_config = {
-                    "temperature": 0.22,
-                    "top_p": 0.92,
-                    "top_k": 32,
-                    "max_output_tokens": 8192,
-                }
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=FORENSIC_SYSTEM_PROMPT,
-                    generation_config=generation_config,
-                )
-                image_part = _read_image_part(image_path)
-                response = model.generate_content([
-                    _build_user_prompt(image_path, theme=theme, source_url=source_url),
-                    image_part,
-                ])
-                text = _extract_response_text(response)
-                if not text:
-                    raise RuntimeError("Gemini returned an empty response")
-                rotator.record_success(key)
-                return text, model_name, key.label
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                rotator.mark_error(key, last_error)
-                print_step("!", f"Gemini error on {model_name}: {last_error[:220]}", C.YELLOW)
-                if not _is_retryable_gemini_error(last_error):
-                    break
-                time.sleep(min(15 * attempt, 45))
-        print_step("~", f"Falling back from {model_name}", C.DIM)
-    raise RuntimeError(f"All Gemini model fallbacks failed. Last error: {last_error}")
-
-
-def _exif_datetime(path: Path) -> Optional[_dt.datetime]:
-    if Image is None:
-        return None
-    try:
-        with Image.open(path) as img:  # type: ignore[union-attr]
-            exif = img.getexif()
-            for tag in (36867, 36868, 306):
-                value = exif.get(tag)
-                if not value:
-                    continue
-                if isinstance(value, bytes):
-                    value = value.decode("utf-8", "ignore")
-                value = str(value).strip()
-                for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                    try:
-                        return _dt.datetime.strptime(value, fmt)
-                    except ValueError:
-                        continue
-    except Exception:
-        return None
-    return None
-
-
-def sort_images_by_exif(paths: Iterable[Path]) -> List[Path]:
-    def key(path: Path) -> Tuple[float, str]:
-        exif_dt = _exif_datetime(path)
-        if exif_dt:
-            return (exif_dt.timestamp(), str(path).lower())
+def get_url_with_timeout(timeout_sec: float = 8.0) -> Optional[str]:
+    print()
+    print(f"  {C.CYAN}{C.BOLD}No URLs in {URL_PICKER_FILE.name}{C.RESET}")
+    print(f"  {C.DIM}Paste image/social URL, or wait {int(timeout_sec)}s / Enter → local images.{C.RESET}")
+    if not HAS_MSVCRT:
         try:
-            return (path.stat().st_mtime, str(path).lower())
-        except Exception:
-            return (0.0, str(path).lower())
-
-    return sorted([p for p in paths if p.exists() and _is_valid_image(p)], key=key)
-
-
-def discover_local_images(image_folder: Path) -> List[Path]:
-    if not image_folder.exists():
-        return []
-    paths = [p for p in image_folder.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS]
-    return sort_images_by_exif(paths)
-
-
-def _prompt_path_for_image(done_folder: Path, image_path: Path) -> Path:
-    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = _safe_slug(image_path.stem, max_len=80)
-    return done_folder / f"{stamp}_{base}_prompt.txt"
-
-
-def _unique_destination(folder: Path, name: str) -> Path:
-    candidate = folder / name
-    if not candidate.exists():
-        return candidate
-    stem = candidate.stem
-    suffix = candidate.suffix
-    for i in range(1, 10000):
-        trial = folder / f"{stem}_{i:03d}{suffix}"
-        if not trial.exists():
-            return trial
-    return folder / f"{stem}_{int(time.time())}{suffix}"
-
-
-def archive_image_and_prompt(
-    image_path: Path,
-    prompt_text: str,
-    done_folder: Path,
-    model_name: str,
-    key_label: str,
-    source_url: Optional[str] = None,
-) -> Tuple[Path, Path]:
-    done_folder.mkdir(parents=True, exist_ok=True)
-    prompt_path = _prompt_path_for_image(done_folder, image_path)
-    metadata = {
-        "source_image": str(image_path),
-        "source_url": source_url,
-        "model": model_name,
-        "key": key_label,
-        "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        "sha256": _hash_file(image_path) if image_path.exists() else None,
-    }
-    prompt_path.write_text(
-        "# FORENSIC IMAGE-TO-PROMPT ENGINE\n\n"
-        + json.dumps(metadata, indent=2, ensure_ascii=False)
-        + "\n\n"
-        + prompt_text.strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    destination = _unique_destination(done_folder, image_path.name)
-    try:
-        shutil.move(str(image_path), str(destination))
-    except Exception:
-        shutil.copy2(str(image_path), str(destination))
-    print_step("+", f"Archived prompt → {prompt_path.name}", C.GREEN)
-    print_step("+", f"Archived image → {destination.name}", C.GREEN)
-    return destination, prompt_path
-
-
-class ActivePauseTimer:
-    """Enforce the original 10min active / 10min pause cadence."""
-
-    def __init__(self, active_seconds: int = ACTIVE_WINDOW_SECONDS, pause_seconds: int = PAUSE_WINDOW_SECONDS) -> None:
-        self.active_seconds = active_seconds
-        self.pause_seconds = pause_seconds
-        self.window_started = time.time()
-
-    def checkpoint(self) -> None:
-        elapsed = time.time() - self.window_started
-        if elapsed < self.active_seconds:
-            return
-        print_step("~", f"Active window reached {self.active_seconds // 60}min; pausing {self.pause_seconds // 60}min", C.YELLOW)
-        time.sleep(self.pause_seconds)
-        self.window_started = time.time()
-
-
-def _read_urls_from_picker(picker_path: Path) -> List[str]:
-    if not picker_path.exists():
-        picker_path.write_text(
-            "# Paste image/social URLs here, one per line. Processed URLs are commented out.\n",
-            encoding="utf-8",
-        )
-        return []
-    urls: List[str] = []
-    for line in picker_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        value = line.strip()
-        if not value or value.startswith("#"):
-            continue
-        if re.match(r"https?://", value, flags=re.I):
-            urls.append(value)
-    return urls
-
-
-def _mark_url_processed(picker_path: Path, url: str, permanent: bool = False) -> None:
-    if not picker_path.exists():
-        return
-    old = picker_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    new_lines: List[str] = []
-    marker = "DONE" if not permanent else "SKIP/PERMANENT"
-    for line in old:
-        if line.strip() == url:
-            new_lines.append(f"# {marker} {time.strftime('%Y-%m-%d %H:%M:%S')} {line}")
-        else:
-            new_lines.append(line)
-    picker_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-
-
-def input_with_timeout(prompt: str, timeout_seconds: int) -> str:
-    result: "queue.Queue[str]" = queue.Queue(maxsize=1)
-
-    def worker() -> None:
-        try:
-            result.put(input(prompt))
-        except Exception:
-            result.put("")
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    try:
-        return result.get(timeout=timeout_seconds).strip()
-    except queue.Empty:
+            raw = input(f"  {C.YELLOW}Enter image URL (or Enter skip): {C.RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+    else:
+        print(f"  {C.YELLOW}Enter image URL (Auto-skips in {int(timeout_sec)}s): {C.RESET}", end="", flush=True)
+        raw = ""
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            if msvcrt.kbhit():
+                raw = input()
+                break
+            time.sleep(0.1)
         print()
-        return ""
-
-
-def gather_urls(args: argparse.Namespace, image_folder: Path) -> List[str]:
-    urls: List[str] = []
-    if args.url:
-        urls.extend(args.url)
-    picker_path = image_folder / URL_PICKER_FILENAME
-    picker_urls = _read_urls_from_picker(picker_path)
-    if picker_urls:
-        print_step("~", f"Loaded {len(picker_urls)} URL(s) from {picker_path.name}", C.CYAN)
-        urls.extend(picker_urls)
-    if not args.no_prompt:
-        pasted = input_with_timeout(f"Paste image/social URL now ({URL_INPUT_TIMEOUT_SECONDS}s timeout, Enter to skip): ", URL_INPUT_TIMEOUT_SECONDS)
-        if pasted:
-            urls.append(pasted)
-    seen: Set[str] = set()
-    unique: List[str] = []
-    for url in urls:
-        if url not in seen:
-            unique.append(url)
-            seen.add(url)
-    return unique
-
-
-def process_one_image(
-    image_path: Path,
-    rotator: GeminiApiKeyRotator,
-    done_folder: Path,
-    timer: ActivePauseTimer,
-    theme: Optional[str] = None,
-    source_url: Optional[str] = None,
-    dry_run: bool = False,
-) -> Optional[Path]:
-    timer.checkpoint()
-    print_step("~", f"Analyzing {image_path.name}", C.CYAN)
-    if dry_run:
-        print_step("~", f"Dry run: would analyze {image_path}", C.DIM)
+    if not raw or not raw.strip():
+        print_step("~", "No URL entered / timeout → using local images only", C.DIM)
         return None
-    prompt_text, model_name, key_label = call_gemini_with_retry(
-        image_path,
-        rotator,
-        theme=theme,
-        source_url=source_url,
-    )
-    _image_archive, prompt_path = archive_image_and_prompt(
-        image_path,
-        prompt_text,
-        done_folder,
-        model_name,
-        key_label,
-        source_url=source_url,
-    )
-    return prompt_path
+    m = re.search(r"https?://[^\s<>\"'\])\}]+", raw.strip(), re.IGNORECASE)
+    if not m:
+        print_step("!", "No valid http(s) URL detected — using local images only", C.YELLOW)
+        return None
+    url = m.group(0).rstrip(".,;:)")
+    print_step("+", f"Using entered URL: {url[:90]}...", C.GREEN)
+    return url
 
 
-def process_urls(
-    urls: Sequence[str],
-    image_folder: Path,
-    done_folder: Path,
-    rotator: GeminiApiKeyRotator,
-    timer: ActivePauseTimer,
-    theme: Optional[str] = None,
-    dry_run: bool = False,
-) -> None:
-    picker_path = image_folder / URL_PICKER_FILENAME
-    download_folder = image_folder / "Downloaded URL Images"
-    for url in urls:
-        timer.checkpoint()
-        print_step("~", f"Downloading URL: {url}", C.CYAN)
-        imgs, log, permanent = download_image_from_url(url, download_folder)
-        log_path = download_folder / f"download_{int(time.time())}.log"
+def get_starting_number() -> int:
+    """
+    Continuous numbering across runs.
+    Reads highest 'Image N' / legacy 'Image No. N' from output log and Done folder.
+    """
+    last = 0
+    # From combined output log
+    if OUTPUT_COMBINED_FILE.exists():
         try:
-            log_path.write_text(log, encoding="utf-8", errors="replace")
+            with open(OUTPUT_COMBINED_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"(?i)^Image(?:\s+No\.)?\s+(\d+)\b", line.strip())
+                    if m:
+                        last = max(last, int(m.group(1)))
         except Exception:
             pass
-        if not imgs:
-            print_step("!", f"No images downloaded for URL (permanent={permanent})", C.YELLOW)
-            if permanent:
-                _mark_url_processed(picker_path, url, permanent=True)
-            continue
-        for img in sort_images_by_exif(imgs):
-            process_one_image(
-                img,
-                rotator,
-                done_folder,
-                timer,
-                theme=theme,
-                source_url=url,
-                dry_run=dry_run,
-            )
-        _mark_url_processed(picker_path, url, permanent=False)
+    # From Done folder filenames: "Image 1 foo.jpg"
+    if DONE_FOLDER.exists():
+        try:
+            for p in DONE_FOLDER.iterdir():
+                if not p.is_file():
+                    continue
+                m = _RE_DONE_NAME.match(p.name)
+                if m:
+                    last = max(last, int(m.group(1)))
+        except Exception:
+            pass
+    return last + 1
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="FORENSIC IMAGE-TO-PROMPT ENGINE")
-    parser.add_argument("--image-folder", default=DEFAULT_IMAGE_FOLDER_NAME, help="Folder containing images to process")
-    parser.add_argument("--done-folder", default=DONE_FOLDER_NAME, help="Archive/output folder")
-    parser.add_argument("--url", action="append", help="Image or social URL to download and process")
-    parser.add_argument("--theme", help="Optional USER_THEMATIC_OVERRIDES key or freeform instruction")
-    parser.add_argument("--limit", type=int, default=0, help="Maximum local images to process after URL downloads")
-    parser.add_argument("--dry-run", action="store_true", help="Discover/sort/download without calling Gemini")
-    parser.add_argument("--no-prompt", action="store_true", help="Skip the 8 second URL paste prompt")
-    parser.add_argument("--status", action="store_true", help="Print parsed key status and exit")
-    return parser
+def move_to_done(path: Path, image_num: int):
+    """Rename like Ultimate Media Tool: Image 1 originalname.jpg"""
+    DONE_FOLDER.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_filename(path.name)
+    new_name = f"Image {image_num} {safe_name}"
+    target = DONE_FOLDER / new_name
+    counter = 1
+    while target.exists():
+        stem = Path(safe_name).stem
+        ext = Path(safe_name).suffix
+        target = DONE_FOLDER / f"Image {image_num} {stem}_{counter}{ext}"
+        counter += 1
+    try:
+        shutil.move(str(path), str(target))
+        print_step("+", f"Moved → Image to Prompt Done\\{target.name}", C.GREEN)
+        return target.name
+    except Exception as e:
+        print_step("!", f"Could not move to Done: {e}", C.YELLOW)
+        return new_name
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    banner()
-    root = Path.cwd()
-    image_folder = _ensure_dir((root / args.image_folder).resolve())
-    done_folder = _ensure_dir((root / args.done_folder).resolve())
-    print_step("~", f"Image folder: {image_folder}", C.DIM)
-    print_step("~", f"Done folder: {done_folder}", C.DIM)
-    print_step("~", f"URL picker: {image_folder / URL_PICKER_FILENAME}", C.DIM)
+def manage_files() -> Tuple[List[Path], int]:
+    # Collapse leftover yt-dlp multi-quality thumbnails from previous runs
+    if IMAGE_FOLDER.exists():
+        existing = [
+            p for p in IMAGE_FOLDER.iterdir()
+            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+            and not _is_already_named_output(p.name)
+        ]
+        if existing:
+            _dedupe_thumbnail_variants(existing)
 
-    keys = parse_user_config(USER_CONFIG)
+    seen: Dict[str, str] = {}
+    if DONE_FOLDER.exists():
+        print_step("~", "Scanning Done folder for multi-run deduplication...", C.DIM)
+        for p in DONE_FOLDER.iterdir():
+            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS:
+                try:
+                    seen[file_md5(p)] = p.name
+                except Exception:
+                    pass
+        print_step("+", f"Loaded {len(seen)} hash(es) from previously processed images.", C.GREEN)
+    all_images = find_all_images()
+    images = []
+    for p in all_images:
+        try:
+            md5 = file_md5(p)
+            if md5 in seen:
+                print_step("~", f"Duplicate of Done/{seen[md5]} → skipping {p.name}", C.YELLOW)
+            else:
+                images.append(p)
+        except Exception:
+            images.append(p)
+    return images, get_starting_number()
+
+
+def write_output(num: int, filename: str, master_prompt: str, forensic_analysis: dict):
+    """Write like Ultimate Media Tool log titles: Image 1 (filename)"""
+    IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_COMBINED_FILE, "a", encoding="utf-8") as f:
+        f.write(f"Image {num} ({filename})\n\n")
+        f.write("\t==== MASTER PROMPT (Copy-Paste Ready) ====\n")
+        f.write(f"\t{master_prompt}\n\n")
+        f.write("\t==== FORENSIC ANALYSIS ====\n")
+        if isinstance(forensic_analysis, dict) and forensic_analysis:
+            for key, value in forensic_analysis.items():
+                f.write(f"\t{key.replace('_', ' ').title()}:\n")
+                f.write(f"\t  {value}\n\n")
+        else:
+            json_str = json.dumps(forensic_analysis or {}, ensure_ascii=False, indent=4)
+            for line in json_str.split("\n"):
+                f.write(f"\t{line}\n")
+            f.write("\n")
+        f.write("=" * 90 + "\n\n")
+
+
+def main():
+    IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
+    print_banner()
+
+    print(f"  {C.DIM}Libraries : {LIB_ROOT}{C.RESET}")
+    print(f"  {C.DIM}Images    : {IMAGE_FOLDER}{C.RESET}")
+    print(f"  {C.DIM}Done      : {DONE_FOLDER}{C.RESET}")
+    print(f"  {C.DIM}Output    : {OUTPUT_COMBINED_FILE}{C.RESET}")
+    print(f"  {C.DIM}Also scans script folder for any image files{C.RESET}")
+    print(f"  {C.DIM}Sort      : EXIF Date created FIRST → file created → mtime (earliest first){C.RESET}")
+    print(f"  {C.DIM}Key delay : {GeminiApiKeyRotator.KEY_SWITCH_DELAY_SECONDS}s between API key switches{C.RESET}\n")
+
+    if is_overrides_empty(USER_THEMATIC_OVERRIDES):
+        print_step("+", "Mode: PURE ORIGINAL (overrides blank → no style change)", C.GREEN)
+    else:
+        print_step("+", "Mode: USER OVERRIDES ACTIVE (style will be forced)", C.YELLOW)
+
+    try:
+        keys = parse_user_config()
+    except Exception as e:
+        print(f"  {C.YELLOW}{e}{C.RESET}")
+        print_step("!", "No valid Gemini API keys in USER_CONFIG (top of script). Exiting.", C.RED)
+        return
+
     rotator = GeminiApiKeyRotator(keys)
-    if args.status:
-        for line in rotator.status_lines():
-            print(line)
-        if not keys:
-            print_step("!", "No usable Gemini API keys configured; placeholders are intentionally ignored.", C.YELLOW)
-        return 0
-    if not keys and not args.dry_run:
-        print_step("!", "No usable Gemini API keys configured in USER_CONFIG. Replace placeholders before live analysis.", C.RED)
-        return 2
+    print_step("+", f"Loaded {len(keys)} Gemini API key(s) from USER_CONFIG", C.GREEN)
+    print(f"  {C.DIM}Rotation: RPM @ {GeminiApiKeyRotator.ROTATE_AT_RPM}/"
+          f"{GeminiApiKeyRotator.RPM_LIMIT} | "
+          f"RPD @ {GeminiApiKeyRotator.ROTATE_AT_RPD}/"
+          f"{GeminiApiKeyRotator.RPD_LIMIT} | "
+          f"Key-switch delay={GeminiApiKeyRotator.KEY_SWITCH_DELAY_SECONDS}s | "
+          f"wrap {len(keys)}→1{C.RESET}")
+    print(rotator.get_status_summary())
 
-    timer = ActivePauseTimer()
-    urls = gather_urls(args, image_folder)
-    if urls:
-        process_urls(urls, image_folder, done_folder, rotator, timer, theme=args.theme, dry_run=args.dry_run)
+    print()
+    ensure_url_picker_file()
+    picker_urls = load_urls_from_picker()
 
-    local_images = discover_local_images(image_folder)
-    if args.limit and args.limit > 0:
-        local_images = local_images[: args.limit]
-    if not local_images:
-        print_step("~", "No local images waiting in Image to Prompt", C.DIM)
-        return 0
-    print_step("~", f"Processing {len(local_images)} local image(s) sorted by EXIF/filesystem time", C.CYAN)
-    for image_path in local_images:
-        process_one_image(
-            image_path,
-            rotator,
-            done_folder,
-            timer,
-            theme=args.theme,
-            source_url=None,
-            dry_run=args.dry_run,
+    def process_image_list(
+        images: List[Path], serial_start: int
+    ) -> Tuple[int, int, int, List[str], List[str]]:
+        if not images:
+            return 0, 0, serial_start, [], []
+        serial = serial_start
+        success = 0
+        failed = 0
+        processed_ok: List[str] = []
+        processed_fail: List[str] = []
+        run_start_time = time.time()
+        next_pause_time = run_start_time + (MAX_RUN_TIME_MIN * 60)
+
+        print_step("+", f"Processing {len(images)} image(s). Starting at Image {serial}\n", C.GREEN)
+        print(f"  {C.BOLD}Active Run Time:{C.RESET} {MAX_RUN_TIME_MIN} mins  |  "
+              f"{C.BOLD}Pause Time:{C.RESET} {PAUSE_TIME_MIN} mins\n")
+
+        for idx, image_path in enumerate(images, 1):
+            current_time = time.time()
+            if current_time >= next_pause_time:
+                resume_at = datetime.fromtimestamp(
+                    current_time + (PAUSE_TIME_MIN * 60)
+                ).strftime("%H:%M:%S")
+                print(f"\n{C.MAGENTA}{C.BOLD}===={C.RESET}")
+                print(f"{C.MAGENTA}          MAX ACTIVE RUN TIME ({MAX_RUN_TIME_MIN} MINS) REACHED.{C.RESET}")
+                print(f"{C.MAGENTA}                FORCED PAUSE FOR {PAUSE_TIME_MIN} MINUTES.{C.RESET}")
+                print(f"{C.MAGENTA}     Script will resume automatically at: {resume_at}.{C.RESET}")
+                print(f"{C.MAGENTA}===={C.RESET}")
+                time.sleep(PAUSE_TIME_MIN * 60)
+                print(f"\n{C.CYAN}{C.BOLD}  ==== FORCED PAUSE COMPLETE. RESUMING... ===={C.RESET}\n")
+                run_start_time = time.time()
+                next_pause_time = run_start_time + (MAX_RUN_TIME_MIN * 60)
+
+            print_progress(idx, len(images), image_path.name)
+            img = prepare_image(image_path)
+            if img is None:
+                failed += 1
+                processed_fail.append(image_path.name)
+                continue
+
+            print_step("~", f"Prepared {img.size[0]}x{img.size[1]}px", C.DIM)
+            parsed = call_gemini_with_retry(rotator, img, image_path.name)
+
+            if parsed is None:
+                failed += 1
+                processed_fail.append(image_path.name)
+                print_step("!", f"Failed on {image_path.name}\n", C.RED)
+            else:
+                master = parsed.get("master_prompt", "")
+                forensic = parsed.get("forensic_analysis", {})
+                preview = textwrap.shorten(str(master), width=120, placeholder="...")
+                print_step("+", f"Analysis complete → Image {serial}", C.GREEN)
+                print(f"      {C.DIM}Preview: {preview}{C.RESET}")
+                write_output(serial, image_path.name, master, forensic)
+                done_name = move_to_done(image_path, serial)
+                print_step("+", f"{done_name} written successfully\n", C.GREEN)
+                processed_ok.append(f"Image {serial} — {done_name}")
+                serial += 1
+                success += 1
+                time.sleep(REQUEST_DELAY_SEC)
+
+        return success, failed, serial, processed_ok, processed_fail
+
+    total_success = 0
+    total_failed = 0
+    total_dl_failed = 0
+    serial = get_starting_number()
+
+    if picker_urls:
+        print(
+            f"\n  {C.CYAN}{C.BOLD}Found {len(picker_urls)} URL(s) in "
+            f"{URL_PICKER_FILE.name} — downloading & processing them first.{C.RESET}\n"
         )
-    print_step("+", "FORENSIC IMAGE-TO-PROMPT ENGINE complete", C.GREEN)
-    return 0
+        for i, url in enumerate(picker_urls, start=1):
+            print(f"  {C.BOLD}[Picker URL {i}/{len(picker_urls)}] {url}{C.RESET}")
+            try:
+                saved_list, dl_log, permanent = download_image_from_url(url, IMAGE_FOLDER)
+                if not saved_list:
+                    if permanent:
+                        print_step("!", "Permanent download failure — URL quarantined", C.RED)
+                        quarantine_url_as_failed(
+                            url, reason="permanent download failure", rotator=rotator
+                        )
+                    else:
+                        print_step("!", "Download failed — URL kept in picker for retry", C.YELLOW)
+                    total_dl_failed += 1
+                    continue
+                print_step("+", f"Downloaded {len(saved_list)} still image(s) from URL", C.GREEN)
+                s, f, serial, ok_names, fail_names = process_image_list(saved_list, serial)
+                total_success += s
+                total_failed += f
+                # Job finished → erase URL from picker + write download/balance record
+                finish_url_job(url, saved_list, ok_names, fail_names, s, f, rotator)
+            except Exception as e:
+                print_step("!", f"Picker URL job failed (URL kept in file): {e}", C.RED)
+                total_dl_failed += 1
+            print()
+        remaining, serial2 = manage_files()
+        serial = max(serial, serial2)
+        if remaining:
+            print_step("~", f"Also found {len(remaining)} local image(s) to process...", C.CYAN)
+            s, f, serial, _, _ = process_image_list(remaining, serial)
+            total_success += s
+            total_failed += f
+    else:
+        manual_url = get_url_with_timeout(timeout_sec=8.0)
+        if manual_url:
+            print(f"\n  {C.CYAN}{C.BOLD}Processing manually entered URL...{C.RESET}\n")
+            saved_list, dl_log, permanent = download_image_from_url(manual_url, IMAGE_FOLDER)
+            if saved_list:
+                print_step("+", f"Downloaded {len(saved_list)} still image(s) from URL", C.GREEN)
+                s, f, serial, ok_names, fail_names = process_image_list(saved_list, serial)
+                total_success += s
+                total_failed += f
+                # Manual URL is not in picker, but still write job record for balance tracking
+                write_job_log(
+                    url=manual_url,
+                    downloaded_files=[p.name for p in saved_list],
+                    processed_ok=ok_names,
+                    processed_fail=fail_names,
+                    success=s,
+                    failed=f,
+                    rotator=rotator,
+                    status="OK (manual URL)" if s > 0 else "FAILED (manual URL)",
+                )
+                if s > 0:
+                    archive_completed_url(manual_url, note=f"manual | {s} ok / {f} fail")
+            else:
+                print_step("!", "Manual URL download failed", C.YELLOW)
+                if permanent:
+                    print_step("~", "This looks like a permanent failure (login/private/no media).", C.DIM)
+                total_dl_failed += 1
+            print()
+
+        print(f"  {C.DIM}Scanning local images...{C.RESET}")
+        images, serial2 = manage_files()
+        serial = max(serial, serial2)
+        if not images and total_success == 0 and total_failed == 0 and total_dl_failed == 0:
+            print_step("!", "No images found!", C.YELLOW)
+            print(f"\n  Put your images in either:")
+            print(f"    1. {IMAGE_FOLDER}")
+            print(f"    2. Or next to this .py file: {SCRIPT_DIR}")
+            print(f"\n  Or put image/social URLs in: {URL_PICKER_FILE.name}")
+            print(f"\n  Supported: png, jpg, jpeg, webp, bmp, tiff, gif")
+            print(f"  Social: Instagram via yt-dlp browser cookies + gallery-dl fallback")
+            return
+        if images:
+            s, f, serial, _, _ = process_image_list(images, serial)
+            total_success += s
+            total_failed += f
+
+    remaining_balance = load_urls_from_picker()
+    print(f"\n{C.CYAN}{C.BOLD}  ==== FINISHED ===={C.RESET}")
+    print_step("+", f"Successfully processed: {total_success}", C.GREEN)
+    print_step("!", f"Failed image processing (still in source folder): {total_failed}",
+               C.RED if total_failed else C.DIM)
+    print_step("!", f"Failed URL downloads: {total_dl_failed}",
+               C.RED if total_dl_failed else C.DIM)
+    print_step("+", f"URL picker remaining balance: {len(remaining_balance)} URL(s)", C.CYAN)
+    print(f"\n{rotator.get_status_summary()}\n")
+    print(f"\n  Output file:\n  {C.CYAN}{OUTPUT_COMBINED_FILE}{C.RESET}")
+    print(f"  Done folder:\n  {C.CYAN}{DONE_FOLDER}{C.RESET}")
+    print(f"  URL picker (active / remaining):\n  {C.CYAN}{URL_PICKER_FILE}{C.RESET}")
+    print(f"  URL picker Done (completed record):\n  {C.CYAN}{URL_PICKER_DONE}{C.RESET}")
+    print(f"  Failed URLs:\n  {C.CYAN}{URL_PICKER_FAILED}{C.RESET}")
+    print(f"  Job log (files + key balance):\n  {C.CYAN}{JOB_LOG_FILE}{C.RESET}\n")
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        if os.name == "nt":
+            try:
+                os.system("title FORENSIC IMAGE-TO-PROMPT ENGINE (ONE-CLICK)")
+            except Exception:
+                pass
+        main()
     except KeyboardInterrupt:
-        print_step("!", "Interrupted by user", C.YELLOW)
-        raise SystemExit(130)
-    except Exception as exc:
-        print_step("!", f"Fatal error: {exc}", C.RED)
-        traceback.print_exc()
-        raise SystemExit(1)
+        print(f"\n\n  {C.YELLOW}Interrupted. Progress is safe in Done folder + output file.{C.RESET}\n")
+    except Exception as e:
+        print("\n" + "!" * 60)
+        print("  FATAL ERROR")
+        print("!" * 60)
+        print(traceback.format_exc())
+        try:
+            log_path = os.path.join(MEDIA_ROOT, "error_log_image.txt")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 80 + "\n" + traceback.format_exc() + "\n")
+            print(f"  Saved: {log_path}")
+        except Exception:
+            pass
+    finally:
+        try:
+            input("  Press Enter to exit...")
+        except Exception:
+            pass
