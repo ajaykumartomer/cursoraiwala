@@ -1464,7 +1464,7 @@ def print_banner(models: Optional[Dict[str, str]] = None) -> None:
     print()
 
 
-def main() -> None:
+def main():
     ensure_utf8_stdio()
     try:
         bootstrap_environment()
