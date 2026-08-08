@@ -1,61 +1,60 @@
 # Instagram Media Downloader
 
-Fast, max-quality downloader for Instagram posts, reels, carousels, stories, and profiles.
+Fast, max-quality Instagram downloader with **automatic browser cookie scanning**.
 
-Uses **gallery-dl** (photos / carousels / stories) + **yt-dlp** (reels / best video bitrate) with browser cookies so Instagram auth works.
+## How auth works (important)
 
-## Setup
+Instagram blocks anonymous downloads. On start, the script:
+
+1. Scans **C:** user profiles for browsers in this order: **Firefox → Chrome → Edge → Brave → others**
+2. Checks Firefox `cookies.sqlite` for Instagram `sessionid`
+3. Exports those cookies to a Netscape `cookies.txt` (most reliable)
+4. Downloads the post/reel/carousel with gallery-dl + yt-dlp
+
+## Setup (Windows)
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Optional but recommended for video merges: install [FFmpeg](https://ffmpeg.org/) and put it on your `PATH`.
+Optional: install [FFmpeg](https://ffmpeg.org/) for video merges.
+
+**Before first run:** open **Firefox**, log into [instagram.com](https://www.instagram.com/), then close Firefox.
 
 ## Usage
 
-Interactive:
-
 ```bash
-python instagram_downloader.py --cookies-from-browser chrome
+# Auto-scan C: for Firefox cookies, then interactive download
+python instagram_downloader.py
+
+# One URL
+python instagram_downloader.py "https://www.instagram.com/reel/XXXX/"
+
+# Scan cookies only (no download)
+python instagram_downloader.py --scan-only
+
+# Deep-scan portable browsers under Users / Program Files
+python instagram_downloader.py --deep-scan --scan-only
+
+# Force a browser / skip auto-scan
+python instagram_downloader.py --cookies-from-browser chrome URL
+python instagram_downloader.py --cookie-file cookies.txt URL
 ```
 
-Single URL:
+Standalone cookie scanner:
 
 ```bash
-python instagram_downloader.py --cookies-from-browser chrome "https://www.instagram.com/reel/XXXX/"
+python browser_cookie_scanner.py
+python browser_cookie_scanner.py --deep
+python browser_cookie_scanner.py --export cookies.txt
 ```
 
-Batch file (`urls.txt`, one URL per line):
+Files save to `~/Downloads/Instagram_Archives/` (Windows: `C:\Users\<you>\Downloads\Instagram_Archives\`).
 
-```bash
-python instagram_downloader.py --cookies-from-browser chrome urls.txt
-```
+## Files
 
-Cookie file instead of browser:
-
-```bash
-python instagram_downloader.py --cookie-file cookies.txt "https://www.instagram.com/p/XXXX/"
-```
-
-Force one engine:
-
-```bash
-python instagram_downloader.py --engine gallery-dl --cookies-from-browser chrome URL
-python instagram_downloader.py --engine yt-dlp --cookies-from-browser chrome URL
-```
-
-Files land in `~/Downloads/Instagram_Archives/Insta_<shortcode>/`.
-
-## Why cookies matter
-
-Instagram blocks most anonymous downloads. Log into Instagram in Chrome/Firefox, then pass `--cookies-from-browser chrome` (or `firefox`, `edge`, `brave`).
-
-## Why the old script failed
-
-| Problem | Fix here |
+| File | Role |
 |---|---|
-| `-f best` crashes on photo posts | Format `bv*+ba/b` + gallery-dl for images |
-| No login session | `--cookies-from-browser` / `--cookie-file` |
-| Subprocess + hard 180s timeout | Native Python APIs, retries, concurrent fragments |
-| Carousels / stories flaky on yt-dlp alone | gallery-dl primary, yt-dlp for reels |
+| `instagram_downloader.py` | Main downloader (auto cookie scan + download) |
+| `browser_cookie_scanner.py` | C: browser cookie discovery (Firefox first) |
+| `requirements.txt` | yt-dlp + gallery-dl |

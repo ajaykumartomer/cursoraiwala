@@ -17,6 +17,9 @@ Usage:
   python instagram_downloader.py "https://www.instagram.com/reel/XXXX/"
   python instagram_downloader.py --cookies-from-browser chrome
   python instagram_downloader.py --cookie-file cookies.txt urls.txt
+
+By default the script SCANS C: for browsers (Firefox → Chrome → others),
+exports Firefox Instagram cookies when found, then downloads.
 """
 
 from __future__ import annotations
@@ -29,6 +32,11 @@ import sys
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
+
+# Allow `python instagram_downloader.py` from any working directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from browser_cookie_scanner import resolve_auth  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Auto-install dependencies
@@ -51,6 +59,16 @@ def ensure_deps() -> None:
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
+    # Make newly installed user-site packages importable in this process
+    import importlib
+    import site
+
+    importlib.invalidate_caches()
+    if hasattr(site, "getusersitepackages"):
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.append(user_site)
+    site.main()
 
 
 ensure_deps()
@@ -297,10 +315,12 @@ def download_one(
 
     if not ok:
         print(
-            "\nFAILED. Instagram almost always needs a logged-in session now.\n"
-            "  1) Log into Instagram in Chrome/Firefox\n"
-            "  2) Re-run with:  --cookies-from-browser chrome\n"
-            "  OR export cookies to Netscape format and use:  --cookie-file cookies.txt\n"
+            "\nFAILED. Instagram needs a logged-in browser session.\n"
+            "  1) Open Firefox (preferred) → instagram.com → log in\n"
+            "  2) Close Firefox (unlocks cookies.sqlite)\n"
+            "  3) Re-run this script (auto-scans C: for Firefox cookies first)\n"
+            "  Or pass: --cookies-from-browser firefox\n"
+            "  Or pass: --cookie-file cookies.txt\n"
         )
     return ok
 
@@ -321,7 +341,7 @@ def load_urls(items: Iterable[str]) -> list[str]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Download Instagram posts/reels/carousels/stories at max quality.",
+        description="Download Instagram media using auto-scanned browser cookies (Firefox first).",
     )
     p.add_argument(
         "targets",
@@ -339,13 +359,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cookies-from-browser",
         metavar="BROWSER",
         default=None,
-        help="Load cookies from browser (chrome, firefox, edge, brave, chromium, …)",
+        help="Skip auto-scan; use this browser (firefox, chrome, edge, brave, …)",
     )
     p.add_argument(
         "--cookie-file",
         type=Path,
         default=None,
-        help="Netscape cookies.txt exported from your browser",
+        help="Skip auto-scan; use this Netscape cookies.txt",
+    )
+    p.add_argument(
+        "--no-auto-cookies",
+        action="store_true",
+        help="Do not scan C: for browser cookies (public posts only)",
+    )
+    p.add_argument(
+        "--drive",
+        default="C:",
+        help="Windows drive to scan for browsers (default: C:)",
+    )
+    p.add_argument(
+        "--deep-scan",
+        action="store_true",
+        help="Also deep-walk Users/Program Files for portable browser cookie DBs",
+    )
+    p.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Only scan/export cookies; do not download",
     )
     p.add_argument(
         "--engine",
@@ -363,14 +403,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def apply_auto_cookies(args: argparse.Namespace) -> argparse.Namespace:
+    """Scan C: for Firefox→Chrome→others unless user already passed cookies."""
+    if args.cookie_file or args.cookies_from_browser or args.no_auto_cookies:
+        return args
+
+    print("=" * 55)
+    print("  AUTO COOKIE SCAN  (Firefox → Chrome → others)")
+    print(f"  Drive: {args.drive}")
+    print("=" * 55)
+
+    browser, cookie_file, _hit = resolve_auth(
+        drive=args.drive,
+        deep=args.deep_scan,
+        export_dir=args.output / "_cookies",
+    )
+    # Prefer exported Netscape file (Firefox IG cookies) when available
+    if cookie_file and cookie_file.is_file():
+        args.cookie_file = cookie_file
+        args.cookies_from_browser = None
+    elif browser:
+        args.cookies_from_browser = browser
+    return args
+
+
 def interactive_loop(args: argparse.Namespace) -> int:
     print("=" * 55)
     print("  INSTAGRAM MEDIA DOWNLOADER  (gallery-dl + yt-dlp)")
     print(f"  Save to: {args.output}")
-    if args.cookies_from_browser:
-        print(f"  Cookies: browser={args.cookies_from_browser}")
-    elif args.cookie_file:
+    if args.cookie_file:
         print(f"  Cookies: file={args.cookie_file}")
+    elif args.cookies_from_browser:
+        print(f"  Cookies: browser={args.cookies_from_browser}")
     else:
         print("  Cookies: NONE (public posts only — login recommended)")
     print("=" * 55)
@@ -403,6 +467,14 @@ def interactive_loop(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
+    args = apply_auto_cookies(args)
+
+    if args.scan_only:
+        if args.cookie_file or args.cookies_from_browser:
+            print("[scan-only] Cookie source ready. Exiting.")
+            return 0
+        print("[scan-only] No usable cookies found.")
+        return 1
 
     if not args.targets:
         return interactive_loop(args)
