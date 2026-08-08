@@ -248,7 +248,7 @@ def is_writable_folder(path: Path) -> bool:
 
 def soft_uac_if_needed() -> None:
     """
-    Elevates only when C:\AKT Media Tools cannot be written by the current user.
+    Elevates only when C:\\AKT Media Tools cannot be written by the current user.
     If elevation is unavailable or declined, the script continues and pip will show
     the real install error instead of forcing an early exit.
     """
