@@ -66,12 +66,12 @@ def main() -> int:
 
         src = input_folder / NASTY_NAME
         bg = audio_folder / "bg2.mp4"
-        make_clip(ffmpeg, src, 1.0)
-        make_clip(ffmpeg, bg, 1.0)
+        make_clip(ffmpeg, src, 6.0)
+        make_clip(ffmpeg, bg, 6.0)
         assert src.is_file(), src
 
         ok = vp.process_file(ffmpeg, src, bg, output_folder)
-        out = output_folder / NASTY_NAME
+        out = output_folder / f"{Path(NASTY_NAME).stem}.mp4"
         if not ok or not out.is_file() or out.stat().st_size == 0:
             print("INTEGRATION FAIL: output missing", file=sys.stderr)
             return 1
