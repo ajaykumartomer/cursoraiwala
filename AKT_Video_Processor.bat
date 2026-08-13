@@ -3,28 +3,29 @@ setlocal EnableDelayedExpansion
 chcp 65001 >nul 2>&1
 title AKT Video Processor - Flipped Moving Repeat (BG2)
 
-:: ============================================================
-::  CONFIGURATION
-:: ============================================================
+:: Original encode (kept, but input is copied to a safe temp name first):
+:: for %%t in ("_input\*.*") DO ffmpeg -y -i "%%t" -ss 4 -i "%%t" -filter_complex "...;amovie=aud/bg2.mp4:loop=9999,volume=1[a2];[a1][a2]amix=duration=shortest" ... "_output\%%~nt.mp4"
+::
+:: Why temp copy: FFmpeg treats @ in the filename as "read options from file"
+:: and # as a comment. amovie=aud/bg2.mp4 stays relative (no C:\ path).
+
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+cd /d "%SCRIPT_DIR%"
 
-set "INPUT_FOLDER=%SCRIPT_DIR%\Input Folder"
-set "OUTPUT_FOLDER=%SCRIPT_DIR%\Output Folder"
-set "AUDIO_FOLDER=%SCRIPT_DIR%\Audio to Add"
-set "AUDIO_FILE=bg2.mp4"
 set "LIB_ROOT=C:\AKT Media Tools"
 set "SITE_PACKAGES=%LIB_ROOT%\Lib\site-packages"
 set "TEMP_INPUT=%TEMP%\akt_video_temp_input.mp4"
-set "TEMP_AUDIO=%TEMP%\akt_video_temp_audio.mp4"
 set "TEMP_OUTPUT=%TEMP%\akt_video_temp_output.mp4"
 set "FILTER_AUDIO=%SCRIPT_DIR%\akt_filter_bg2.txt"
 set "FILTER_NOAUDIO=%SCRIPT_DIR%\akt_filter_bg2_noaudio.txt"
 set "LOG_FILE=%SCRIPT_DIR%\ffmpeg_log.txt"
+set "AUD_DIR=%SCRIPT_DIR%\aud"
+set "AUD_FILE=%AUD_DIR%\bg2.mp4"
 
-:: ============================================================
-::  SOFT UAC
-:: ============================================================
+if exist "%SCRIPT_DIR%\_input" (set "INPUT_FOLDER=%SCRIPT_DIR%\_input") else (set "INPUT_FOLDER=%SCRIPT_DIR%\Input Folder")
+if exist "%SCRIPT_DIR%\_output" (set "OUTPUT_FOLDER=%SCRIPT_DIR%\_output") else (set "OUTPUT_FOLDER=%SCRIPT_DIR%\Output Folder")
+
 call :TestLibWrite
 if "!LIB_OK!"=="YES" goto :MAIN_START
 
@@ -60,9 +61,6 @@ net session >nul 2>&1
 if %errorlevel% equ 0 icacls "%LIB_ROOT%" /grant "%USERNAME%:(OI)(CI)F" /T /C >nul 2>&1
 exit /b
 
-:: ============================================================
-::  MAIN
-:: ============================================================
 :MAIN_START
 echo.
 echo ============================================================
@@ -73,7 +71,6 @@ echo.
 echo  [OK] Library folder writable
 echo.
 
-:: --- Python ---
 set "PYTHON="
 where py >nul 2>&1 && set "PYTHON=py"
 if not defined PYTHON where python >nul 2>&1 && set "PYTHON=python"
@@ -86,7 +83,6 @@ echo  [OK] Python: %PYTHON%
 %PYTHON% --version 2>nul
 echo.
 
-:: --- Libraries ---
 echo  [~] Checking libraries...
 echo.
 set "NEED_PIL=NO"
@@ -109,7 +105,6 @@ if "!NEED_GENAI!"=="YES" (
 )
 echo.
 
-:: --- FFmpeg ---
 where ffmpeg >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [ERROR] FFmpeg not found in PATH.
@@ -125,38 +120,31 @@ if not exist "%FILTER_AUDIO%" (
     exit /b 1
 )
 
-:: --- Folders ---
 echo  [~] Checking folders...
 echo.
-if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: Input Folder) else (echo  [OK] Input Folder exists)
-if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: Output Folder) else (echo  [OK] Output Folder exists)
-if not exist "%AUDIO_FOLDER%" (mkdir "%AUDIO_FOLDER%" & echo  [+] Created: Audio to Add) else (echo  [OK] Audio to Add folder exists)
-echo.
+if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: %INPUT_FOLDER%) else (echo  [OK] Input: %INPUT_FOLDER%)
+if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: %OUTPUT_FOLDER%) else (echo  [OK] Output: %OUTPUT_FOLDER%)
+if not exist "%AUD_DIR%" mkdir "%AUD_DIR%"
 
-:: --- Audio ---
-set "AUDIO_PATH=%AUDIO_FOLDER%\%AUDIO_FILE%"
+:: Prefer original aud/bg2.mp4; otherwise copy from Audio to Add
+if not exist "%AUD_FILE%" if exist "%SCRIPT_DIR%\Audio to Add\bg2.mp4" copy /y "%SCRIPT_DIR%\Audio to Add\bg2.mp4" "%AUD_FILE%" >nul 2>&1
+
 set "USE_AUDIO=NO"
-if exist "%AUDIO_PATH%" (
-    echo  [OK] Audio: %AUDIO_FILE%
-    copy /y "%AUDIO_PATH%" "%TEMP_AUDIO%" >nul 2>&1
-    if exist "%TEMP_AUDIO%" (
-        set "USE_AUDIO=YES"
-    ) else (
-        echo  [WARN] Could not copy audio to temp
-    )
+if exist "%AUD_FILE%" (
+    echo  [OK] Audio: aud/bg2.mp4
+    set "USE_AUDIO=YES"
 ) else (
-    echo  [WARN] Audio not found: %AUDIO_PATH%
+    echo  [WARN] aud/bg2.mp4 not found. Put bg2.mp4 in aud\  or in Audio to Add\
     echo         Processing WITHOUT background audio.
 )
 echo.
 
-:: --- Count files ---
 set "FILE_COUNT=0"
 for %%f in ("%INPUT_FOLDER%\*.*") do (
     if exist "%%~f" if not exist "%%~f\" set /a FILE_COUNT+=1
 )
 if %FILE_COUNT% equ 0 (
-    echo  [ERROR] No files in: Input Folder
+    echo  [ERROR] No files in: %INPUT_FOLDER%
     pause
     exit /b 1
 )
@@ -165,14 +153,6 @@ echo.
 
 if exist "%LOG_FILE%" del "%LOG_FILE%" >nul 2>&1
 
-:: ============================================================
-::  PROCESS
-::  Input/audio are copied to ASCII temp names so @ and # in
-::  the original filename cannot split the FFmpeg command.
-::  The filter graph is loaded from a file so cmd.exe cannot
-::  treat | and < inside pan= as pipe/redirect.
-::  Background audio is a third -i input, not amovie='C:\...'.
-:: ============================================================
 echo ============================================================
 echo   STARTING VIDEO PROCESSING
 echo ============================================================
@@ -199,7 +179,7 @@ for %%t in ("%INPUT_FOLDER%\*.*") do (
             echo.
         ) else (
             if "!USE_AUDIO!"=="YES" (
-                ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -stream_loop -1 -i "%TEMP_AUDIO%" -filter_complex_script "%FILTER_AUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >>"%LOG_FILE%" 2>&1
+                ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -filter_complex_script "%FILTER_AUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >>"%LOG_FILE%" 2>&1
             ) else (
                 ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -filter_complex_script "%FILTER_NOAUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >>"%LOG_FILE%" 2>&1
             )
@@ -224,16 +204,9 @@ for %%t in ("%INPUT_FOLDER%\*.*") do (
     )
 )
 
-:: ============================================================
-::  CLEANUP
-:: ============================================================
 if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
-if exist "%TEMP_AUDIO%" del "%TEMP_AUDIO%" >nul 2>&1
 if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
 
-:: ============================================================
-::  SUMMARY
-:: ============================================================
 echo ============================================================
 echo   PROCESSING COMPLETE
 echo ============================================================
@@ -244,7 +217,7 @@ echo  Processed   : %PROCESSED%
 echo  Failed      : %FAILED%
 echo  Input       : %INPUT_FOLDER%
 echo  Output      : %OUTPUT_FOLDER%
-echo  Audio       : %AUDIO_PATH%
+echo  Audio       : %AUD_FILE%
 if %FAILED% gtr 0 (
     echo.
     echo  [!] FFmpeg errors saved to: ffmpeg_log.txt

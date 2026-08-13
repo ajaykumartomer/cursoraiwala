@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 r"""
-AKT VIDEO PROCESSOR
-Effect: Flipped Moving Repeat (Series 2 - BG2)
+AKT VIDEO PROCESSOR — same encode as the original one-liner:
 
-Matches AKT_Video_Processor.bat:
-  copy source -> ASCII temp names
-  ffmpeg -i temp -ss 4 -i temp [-stream_loop -1 -i bg]
-  -filter_complex_script (not an inline graph, not amovie=)
-  encode libx264/aac and copy the result to Output Folder\<stem>.mp4
+  ffmpeg -y -i INPUT -ss 4 -i INPUT -filter_complex "...;amovie=aud/bg2.mp4:loop=9999,volume=1[a2];[a1][a2]amix=duration=shortest" ... OUTPUT
+
+Input is copied to a temp name first so @ and # in YouTube titles cannot
+split FFmpeg. amovie stays aud/bg2.mp4 (relative, no C:\\ path).
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ import time
 from pathlib import Path
 
 LIB_ROOT = Path(r"C:\AKT Media Tools") if os.name == "nt" else Path.home() / "AKT Media Tools"
-AUDIO_BG_NAME = "bg2.mp4"
 OVERLAY_START_SS = "4"
 
 METADATA_CLEAR = [
@@ -99,35 +96,37 @@ def build_ffmpeg_cmd(
     ffmpeg: str,
     video_name: str,
     output_name: str,
-    *,
-    audio_name: str | None,
     filter_script: str,
 ) -> list[str]:
-    cmd = [ffmpeg, "-y", "-i", video_name, "-ss", OVERLAY_START_SS, "-i", video_name]
-    if audio_name:
-        cmd.extend(["-stream_loop", "-1", "-i", audio_name])
-    cmd.extend(["-filter_complex_script", filter_script])
-    cmd.extend(
-        [
-            "-vcodec",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            "30",
-            "-g",
-            "60",
-            "-b:v",
-            "1550k",
-            "-shortest",
-            "-acodec",
-            "aac",
-            "-b:a",
-            "128k",
-            "-ar",
-            "44100",
-        ]
-    )
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        video_name,
+        "-ss",
+        OVERLAY_START_SS,
+        "-i",
+        video_name,
+        "-filter_complex_script",
+        filter_script,
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "30",
+        "-g",
+        "60",
+        "-b:v",
+        "1550k",
+        "-shortest",
+        "-acodec",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ar",
+        "44100",
+    ]
     for key in METADATA_CLEAR:
         cmd.extend(["-metadata", f"{key}="])
     cmd.extend(
@@ -144,6 +143,25 @@ def build_ffmpeg_cmd(
         ]
     )
     return cmd
+
+
+def resolve_folders(base: Path) -> tuple[Path, Path, Path]:
+    input_folder = base / "_input" if (base / "_input").is_dir() else base / "Input Folder"
+    output_folder = base / "_output" if (base / "_output").is_dir() else base / "Output Folder"
+    aud = base / "aud"
+    return input_folder, output_folder, aud
+
+
+def resolve_bg(base: Path, aud: Path) -> Path | None:
+    dest = aud / "bg2.mp4"
+    if dest.is_file():
+        return dest
+    alt = base / "Audio to Add" / "bg2.mp4"
+    if alt.is_file():
+        aud.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(alt, dest)
+        return dest
+    return dest if dest.is_file() else None
 
 
 def process_file(
@@ -169,18 +187,9 @@ def process_file(
         safe_in = tmp / "input.mp4"
         safe_out = tmp / "output.mp4"
         link_or_copy(src, safe_in)
-        audio_name = None
         if bg is not None:
-            safe_bg = tmp / "bg.mp4"
-            link_or_copy(bg, safe_bg)
-            audio_name = safe_bg.name
-        cmd = build_ffmpeg_cmd(
-            ffmpeg,
-            safe_in.name,
-            safe_out.name,
-            audio_name=audio_name,
-            filter_script=str(script),
-        )
+            link_or_copy(bg, tmp / "aud" / "bg2.mp4")
+        cmd = build_ffmpeg_cmd(ffmpeg, safe_in.name, safe_out.name, str(script))
         log_handle = None
         try:
             if log_file is not None:
@@ -210,22 +219,6 @@ def process_file(
     return True
 
 
-def folder_layout(base: Path) -> tuple[Path, Path, Path]:
-    return (
-        base / "Input Folder",
-        base / "Output Folder",
-        base / "Audio to Add",
-    )
-
-
-def list_inputs(input_folder: Path) -> list[Path]:
-    files = []
-    for path in sorted(input_folder.iterdir(), key=lambda p: p.name.lower()):
-        if path.is_file():
-            files.append(path)
-    return files
-
-
 def main() -> int:
     print()
     print("=" * 60)
@@ -242,33 +235,24 @@ def main() -> int:
     print()
 
     base = script_dir()
-    input_folder, output_folder, audio_folder = folder_layout(base)
-    info("Checking folders...")
-    print()
-    for folder, label in (
-        (input_folder, "Input Folder"),
-        (output_folder, "Output Folder"),
-        (audio_folder, "Audio to Add"),
-    ):
-        if not folder.is_dir():
-            folder.mkdir(parents=True, exist_ok=True)
-            ok(f"Created: {label}")
-        else:
-            ok(f"{label} exists")
-    print()
+    os.chdir(base)
+    input_folder, output_folder, aud = resolve_folders(base)
+    input_folder.mkdir(parents=True, exist_ok=True)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    aud.mkdir(parents=True, exist_ok=True)
+    ok(f"Input: {input_folder}")
+    ok(f"Output: {output_folder}")
 
-    bg_path = audio_folder / AUDIO_BG_NAME
-    bg = bg_path if bg_path.is_file() else None
+    bg = resolve_bg(base, aud)
     if bg:
-        ok(f"Audio: {AUDIO_BG_NAME}")
+        ok("Audio: aud/bg2.mp4")
     else:
-        print(f" [WARN] Audio not found: {bg_path}")
-        print("         Processing WITHOUT background audio.")
+        print(" [WARN] aud/bg2.mp4 not found. Processing WITHOUT background audio.")
     print()
 
-    videos = list_inputs(input_folder)
+    videos = [p for p in sorted(input_folder.iterdir(), key=lambda x: x.name.lower()) if p.is_file()]
     if not videos:
-        fail("No files in: Input Folder")
+        fail(f"No files in: {input_folder}")
         return 1
     ok(f"Found {len(videos)} file(s) to process")
     print()
@@ -301,7 +285,7 @@ def main() -> int:
     print(f" Failed      : {failed}")
     print(f" Input       : {input_folder}")
     print(f" Output      : {output_folder}")
-    print(f" Audio       : {bg_path}")
+    print(f" Audio       : {aud / 'bg2.mp4'}")
     if failed:
         print()
         print(f" [!] FFmpeg errors saved to: {log_file.name}")
