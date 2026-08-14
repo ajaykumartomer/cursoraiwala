@@ -8,6 +8,8 @@ title AKT Video Processor - Flipped Moving Repeat
 :: ============================================================
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+cd /d "%SCRIPT_DIR%"
+if exist "%SCRIPT_DIR%\_akt_temp" rd /s /q "%SCRIPT_DIR%\_akt_temp" 2>nul
 
 set "INPUT_FOLDER=%SCRIPT_DIR%\Input Folder"
 set "OUTPUT_FOLDER=%SCRIPT_DIR%\Output Folder"
@@ -121,7 +123,6 @@ echo.
 if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: Input Folder) else (echo  [OK] Input Folder exists)
 if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: Output Folder) else (echo  [OK] Output Folder exists)
 if not exist "%AUDIO_FOLDER%" (mkdir "%AUDIO_FOLDER%" & echo  [+] Created: Audio to Add) else (echo  [OK] Audio to Add folder exists)
-if exist "%SCRIPT_DIR%\_akt_temp" rmdir /s /q "%SCRIPT_DIR%\_akt_temp" >nul 2>&1
 echo.
 
 :: --- Audio Setup (Looping Playlist) ---
@@ -214,6 +215,7 @@ for /L %%N in (1, 1, %FILE_COUNT%) do (
 ::  CLEANUP
 :: ============================================================
 timeout /t 1 /nobreak >nul
+if exist "%SCRIPT_DIR%\_akt_temp" rd /s /q "%SCRIPT_DIR%\_akt_temp" 2>nul
 if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
 if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
 if exist "%CONCAT_FILE%" del "%CONCAT_FILE%" >nul 2>&1
