@@ -15,12 +15,11 @@ set "AUDIO_FOLDER=%SCRIPT_DIR%\Audio to Add"
 set "LIB_ROOT=C:\AKT Media Tools"
 set "SITE_PACKAGES=%LIB_ROOT%\Lib\site-packages"
 
-:: Temp folders ON SAME DRIVE as script
-set "TEMP_DIR=%SCRIPT_DIR%\_akt_temp"
-set "TEMP_INPUT=%TEMP_DIR%\_input.mp4"
-set "TEMP_OUTPUT=%TEMP_DIR%\_output.mp4"
-set "CONCAT_FILE=%TEMP_DIR%\audio_concat.txt"
-set "NAME_FILE=%TEMP_DIR%\current_name.txt"
+:: Safe names only. FFmpeg breaks on @ and # in the real title.
+set "TEMP_INPUT=%SCRIPT_DIR%\_input.mp4"
+set "TEMP_OUTPUT=%SCRIPT_DIR%\_output.mp4"
+set "CONCAT_FILE=%SCRIPT_DIR%\audio_concat.txt"
+set "NAME_FILE=%SCRIPT_DIR%\current_name.txt"
 
 :: ============================================================
 ::  SOFT UAC
@@ -122,9 +121,6 @@ echo.
 if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: Input Folder) else (echo  [OK] Input Folder exists)
 if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: Output Folder) else (echo  [OK] Output Folder exists)
 if not exist "%AUDIO_FOLDER%" (mkdir "%AUDIO_FOLDER%" & echo  [+] Created: Audio to Add) else (echo  [OK] Audio to Add folder exists)
-
-:: Create Temp Directory
-if not exist "%TEMP_DIR%" mkdir "%TEMP_DIR%"
 echo.
 
 :: --- Audio Setup (Looping Playlist) ---
@@ -135,7 +131,7 @@ if exist "%CONCAT_FILE%" del "%CONCAT_FILE%" >nul 2>&1
 
 for %%a in ("%AUDIO_FOLDER%\*.*") do (
     set /a AUDIO_COUNT+=1
-    copy /Y "%%a" "%TEMP_DIR%\_audio_!AUDIO_COUNT!%%~xa" >nul 2>&1
+    copy /Y "%%a" "%SCRIPT_DIR%\_audio_!AUDIO_COUNT!%%~xa" >nul 2>&1
     echo file '_audio_!AUDIO_COUNT!%%~xa' >> "%CONCAT_FILE%"
 )
 
@@ -187,7 +183,7 @@ for /L %%N in (1, 1, %FILE_COUNT%) do (
     powershell -NoProfile -Command "$f = Get-ChildItem -LiteralPath '%INPUT_FOLDER%' -File | Select-Object -First 1; if ($f) { Move-Item -LiteralPath $f.FullName -Destination '%TEMP_INPUT%' -Force; [System.IO.File]::WriteAllText('%NAME_FILE%', $f.Name, [System.Text.Encoding]::UTF8) }" >nul 2>&1
 
     if not exist "%TEMP_INPUT%" (
-        echo  [FAIL] Cannot stage file to temp folder. Skipping...
+        echo  [FAIL] Cannot stage file. Skipping...
         set /a FAILED+=1
     ) else (
         
@@ -217,7 +213,11 @@ for /L %%N in (1, 1, %FILE_COUNT%) do (
 ::  CLEANUP
 :: ============================================================
 timeout /t 1 /nobreak >nul
-if exist "%TEMP_DIR%" rmdir /s /q "%TEMP_DIR%" >nul 2>&1
+if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
+if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
+if exist "%CONCAT_FILE%" del "%CONCAT_FILE%" >nul 2>&1
+if exist "%NAME_FILE%" del "%NAME_FILE%" >nul 2>&1
+del "%SCRIPT_DIR%\_audio_*" >nul 2>&1
 
 :: ============================================================
 ::  SUMMARY
