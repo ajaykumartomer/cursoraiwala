@@ -2,6 +2,7 @@
 """Verify SplitMergedScripts.py against a MergedScripts.txt fixture."""
 
 from pathlib import Path
+import hashlib
 import shutil
 import tempfile
 
@@ -60,18 +61,23 @@ MERGED = "\n".join(
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="split-bats-"))
     try:
-        (tmp / "MergedScripts.txt").write_text(MERGED, encoding="utf-8")
+        merged = tmp / "MergedScripts.txt"
+        merged.write_text(MERGED, encoding="utf-8")
+        digest = hashlib.sha256(merged.read_bytes()).hexdigest()
         created = split_merged_scripts(tmp)
         assert created == [
             "2G Flipped Moving Repeat.bat",
             "2O Repeat _ Center Zoom In Out.bat",
         ], created
-        a = (tmp / created[0]).read_text(encoding="utf-8").replace("\r\n", "\n")
-        b = (tmp / created[1]).read_text(encoding="utf-8").replace("\r\n", "\n")
+        assert hashlib.sha256(merged.read_bytes()).hexdigest() == digest
+        out = tmp / "extracted_bats"
+        a = (out / created[0]).read_text(encoding="utf-8").replace("\r\n", "\n")
+        b = (out / created[1]).read_text(encoding="utf-8").replace("\r\n", "\n")
         assert a == LINE_A + "\n", repr(a)
         assert b == LINE_B + "\n", repr(b)
         assert "Script " not in a and "Script " not in b
-        print("ok: extracted", len(created), "files with original names")
+        assert not (tmp / created[0]).exists()
+        print("ok: extracted", len(created), "files; MergedScripts.txt unchanged")
     finally:
         shutil.rmtree(tmp)
 

@@ -1,10 +1,11 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 if not exist "MergedScripts.txt" (
     echo.
     echo [ERROR] MergedScripts.txt was not found in this folder.
+    echo This splitter never deletes that file.
     pause
     exit /b 1
 )
@@ -14,23 +15,36 @@ echo ============================================
 echo       DISINTEGRATING SCRIPTS
 echo ============================================
 echo.
+echo Input file is READ-ONLY. Output goes to extracted_bats\
+echo.
 
-:: CMD cannot split these files itself: ffmpeg lines contain | & ( ) %% and are
-:: often longer than the 8191-character command limit. PowerShell reads them as
-:: plain text and writes each block to the original .bat name inside { }.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { Set-Location -LiteralPath '%~dp0'; $p='%~f0'; $t=Get-Content -LiteralPath $p -Raw; $m='<'+'<<PS>>>'; $i=$t.IndexOf($m); Invoke-Expression $t.Substring($i+$m.Length) }"
+where python >nul 2>&1
+if not errorlevel 1 (
+    python "%~dp0SplitMergedScripts.py"
+    set "err=!ERRORLEVEL!"
+    goto :done
+)
+
+where python3 >nul 2>&1
+if not errorlevel 1 (
+    python3 "%~dp0SplitMergedScripts.py"
+    set "err=!ERRORLEVEL!"
+    goto :done
+)
+
+:: CMD cannot parse ffmpeg lines. PowerShell reads MergedScripts.txt as text
+:: and writes each block into extracted_bats\ using the original filename.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& { Set-Location -LiteralPath '%~dp0'; $p='%~f0'; $t=Get-Content -LiteralPath $p -Raw; $m='<'+'<<PS>>>'; $i=$t.IndexOf($m); if ($i -lt 0) { throw 'splitter body missing' }; Invoke-Expression $t.Substring($i+$m.Length) }"
 set "err=%ERRORLEVEL%"
 
-echo.
-echo ============================================
-echo    COMPLETED!
-echo ============================================
+:done
 echo.
 if not "%err%"=="0" (
-    echo Split failed. If PowerShell is blocked, run: python SplitMergedScripts.py
+    echo Split failed. MergedScripts.txt was not deleted by this script.
     pause
     exit /b %err%
 )
+echo MergedScripts.txt was left untouched.
 pause
 exit /b 0
 
@@ -42,8 +56,8 @@ if (-not (Test-Path -LiteralPath $inputFile)) {
     exit 1
 }
 
-$bytes = [System.IO.File]::ReadAllBytes($inputFile)
-$text = [System.Text.Encoding]::UTF8.GetString($bytes)
+$sourceBefore = [System.IO.File]::ReadAllBytes($inputFile)
+$text = [System.Text.Encoding]::UTF8.GetString($sourceBefore)
 if ($text.StartsWith([char]0xFEFF)) { $text = $text.Substring(1) }
 $text = $text -replace "`r`n", "`n" -replace "`r", "`n"
 $lines = $text.Split("`n")
@@ -51,25 +65,38 @@ if ($lines.Length -gt 0 -and $lines[$lines.Length - 1] -eq '') {
     $lines = $lines[0..($lines.Length - 2)]
 }
 
+$outDir = Join-Path (Get-Location) 'extracted_bats'
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
 $header = [regex]'^Script\s+\d+\s+\{(.+)\}\s*$'
+$protected = @('mergedscripts.txt','mergeallbats.bat','splitmergedscripts.bat','splitmergedscripts.py')
 $currentName = $null
 $buf = New-Object System.Collections.Generic.List[string]
 $skip = 0
 $count = 0
+
+function Get-SafeName([string]$name) {
+    $base = [System.IO.Path]::GetFileName($name.Replace('\','/'))
+    if ([string]::IsNullOrWhiteSpace($base)) { throw "unsafe filename: $name" }
+    if ($protected -contains $base.ToLowerInvariant()) { throw "refusing protected file: $base" }
+    if (-not $base.ToLowerInvariant().EndsWith('.bat')) { throw "refusing non-.bat output: $base" }
+    return $base
+}
 
 function Save-Current {
     if ([string]::IsNullOrEmpty($script:currentName)) { return }
     while ($script:buf.Count -gt 0 -and [string]::IsNullOrWhiteSpace($script:buf[$script:buf.Count - 1])) {
         $script:buf.RemoveAt($script:buf.Count - 1)
     }
-    $outPath = Join-Path (Get-Location) $script:currentName
+    $safe = Get-SafeName $script:currentName
+    $outPath = Join-Path $outDir $safe
     $enc = New-Object System.Text.UTF8Encoding $false
     $body = $script:buf.ToArray()
     $joined = [string]::Join("`r`n", $body)
     if ($body.Length -gt 0) { $joined += "`r`n" }
     [System.IO.File]::WriteAllText($outPath, $joined, $enc)
     $script:count++
-    Write-Host "[+] Created: $($script:currentName)"
+    Write-Host "[+] Created: extracted_bats\$safe"
     $script:buf.Clear()
 }
 
@@ -91,7 +118,14 @@ foreach ($line in $lines) {
 }
 Save-Current
 
+$sourceAfter = [System.IO.File]::ReadAllBytes($inputFile)
+if ($sourceAfter.Length -ne $sourceBefore.Length) {
+    throw 'MergedScripts.txt changed during split'
+}
+
 Write-Host ""
 Write-Host "Total Scripts Extracted: $count"
+Write-Host 'Input left untouched: MergedScripts.txt'
+Write-Host 'Output folder: extracted_bats'
 if ($count -eq 0) { exit 1 }
 exit 0
