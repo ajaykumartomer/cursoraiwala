@@ -121,6 +121,7 @@ echo.
 if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: Input Folder) else (echo  [OK] Input Folder exists)
 if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: Output Folder) else (echo  [OK] Output Folder exists)
 if not exist "%AUDIO_FOLDER%" (mkdir "%AUDIO_FOLDER%" & echo  [+] Created: Audio to Add) else (echo  [OK] Audio to Add folder exists)
+if exist "%SCRIPT_DIR%\_akt_temp" rmdir /s /q "%SCRIPT_DIR%\_akt_temp" >nul 2>&1
 echo.
 
 :: --- Audio Setup (Looping Playlist) ---
