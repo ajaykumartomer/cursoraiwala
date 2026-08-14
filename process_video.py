@@ -89,7 +89,22 @@ def has_audio(path: Path) -> bool:
     return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
 
 
-def nvenc_available() -> bool:
+def ffmpeg_encoder_list() -> str:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout
+
+
+def encoder_exists(name: str, listing: str | None = None) -> bool:
+    blob = listing if listing is not None else ffmpeg_encoder_list()
+    return name in blob
+
+
+def nvidia_gpu_present() -> bool:
     if shutil.which("nvidia-smi") is None:
         return False
     try:
@@ -101,13 +116,56 @@ def nvenc_available() -> bool:
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return "hevc_nvenc" in proc.stdout
+    return True
+
+
+def nvenc_available() -> bool:
+    return nvidia_gpu_present() and encoder_exists("hevc_nvenc")
+
+
+def pick_simple_video_encoder(prefer: str) -> tuple[str, list[str]]:
+    """Return (label, ffmpeg args after -c:v) for a widely playable MP4."""
+    listing = ffmpeg_encoder_list()
+    want_gpu = prefer in ("auto", "nvenc")
+    if want_gpu and nvidia_gpu_present() and encoder_exists("h264_nvenc", listing):
+        return "h264_nvenc", [
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-cq",
+            "23",
+            "-b:v",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    if prefer == "nvenc":
+        raise PipelineError("h264_nvenc requested but not available in this FFmpeg build")
+    if encoder_exists("libx264", listing):
+        return "libx264", [
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    if encoder_exists("libx265", listing):
+        return "libx265", [
+            "libx265",
+            "-preset",
+            "medium",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-tag:v",
+            "hvc1",
+        ]
+    raise PipelineError("No usable H.264/HEVC encoder in this FFmpeg build")
 
 
 def stage1_prores(src: Path, dest: Path) -> None:
@@ -280,15 +338,81 @@ def stage3_loudnorm(src: Path, dest: Path) -> None:
     )
 
 
-def process_one(src: Path, out_dir: Path, preset: str, encoder: str) -> Path:
+def loudnorm_filter_from_src(src: Path) -> str | None:
+    if not has_audio(src):
+        return None
+    measure = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-vn",
+        "-af",
+        f"loudnorm=I={LOUDNORM_I}:LRA={LOUDNORM_LRA}:TP={LOUDNORM_TP}:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    print("+", " ".join(measure), flush=True)
+    proc = subprocess.run(measure, check=True, text=True, capture_output=True)
+    stats = parse_loudnorm_json(proc.stderr)
+    return (
+        f"loudnorm=I={LOUDNORM_I}:LRA={LOUDNORM_LRA}:TP={LOUDNORM_TP}"
+        f":measured_I={stats['input_i']}"
+        f":measured_LRA={stats['input_lra']}"
+        f":measured_TP={stats['input_tp']}"
+        f":measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}"
+        f":linear=true"
+    )
+
+
+def simple_encode(src: Path, dest: Path, encoder: str) -> None:
+    """One-pass delivery encode: even scale + H.264 + AAC + loudnorm."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    label, vargs = pick_simple_video_encoder(encoder)
+    print(f"Simple encode using {label}", flush=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-vf",
+        EVEN_SCALE,
+        "-c:v",
+        *vargs,
+        "-movflags",
+        "+faststart",
+        "-map_metadata",
+        "0",
+    ]
+    af = loudnorm_filter_from_src(src)
+    if af:
+        cmd += ["-af", af, "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        print("No audio stream; video only.", flush=True)
+    cmd.append(str(dest))
+    run(cmd)
+
+
+def process_one(
+    src: Path, out_dir: Path, preset: str, encoder: str, pipeline: str
+) -> Path:
     if not src.is_file():
         raise PipelineError(f"Input file not found: {src}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = src.stem
+
+    if pipeline == "simple":
+        final = out_dir / f"{stem}_{preset}.mp4"
+        print(f"Simple pipeline for {src.name}", flush=True)
+        simple_encode(src, final, encoder)
+        print(f"Finalized: {final}", flush=True)
+        return final
+
     final = out_dir / f"{stem}_{preset}_hevc.mp4"
     use_nvenc = encoder == "nvenc" or (encoder == "auto" and nvenc_available())
-
     print(f"GPU path: {'hevc_nvenc' if use_nvenc else 'libx265'}", flush=True)
 
     with tempfile.TemporaryDirectory(prefix="master_pipeline_") as tmp:
@@ -320,7 +444,10 @@ def collect_inputs(input_dir: Path, single: Path | None) -> list[Path]:
         if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
     )
     if not files:
-        raise PipelineError(f"No video files in {input_dir}")
+        raise PipelineError(
+            f"No video files in {input_dir}. "
+            "Put a .mp4 / .mov / .mkv there, then run: python3 process_video.py"
+        )
     return files
 
 
@@ -356,7 +483,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--encoder",
         choices=("auto", "nvenc", "cpu"),
         default="auto",
-        help="hevc_nvenc if a GPU is present, otherwise libx265",
+        help="Prefer GPU if present; simple mode uses H.264, full mode uses HEVC",
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=("simple", "full"),
+        default="simple",
+        help="simple = one FFmpeg encode (default); full = ProRes then HEVC",
     )
     return parser.parse_args(argv)
 
@@ -369,7 +502,9 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         sources = collect_inputs(args.input_dir, args.src)
         for src in sources:
-            process_one(src, args.output_dir, args.preset, args.encoder)
+            process_one(
+                src, args.output_dir, args.preset, args.encoder, args.pipeline
+            )
     except PipelineError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
