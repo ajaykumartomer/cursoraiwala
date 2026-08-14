@@ -1,229 +1,43 @@
 @echo off
-setlocal EnableDelayedExpansion
 chcp 65001 >nul 2>&1
-title AKT Video Processor - Flipped Moving Repeat (BG2)
+title AKT Video Processor - BG2
+cd /d "%~dp0"
 
-:: Original encode (kept, but input is copied to a safe temp name first):
-:: for %%t in ("_input\*.*") DO ffmpeg -y -i "%%t" -ss 4 -i "%%t" -filter_complex "...;amovie=aud/bg2.mp4:loop=9999,volume=1[a2];[a1][a2]amix=duration=shortest" ... "_output\%%~nt.mp4"
-::
-:: Why temp copy: FFmpeg treats @ in the filename as "read options from file"
-:: and # as a comment. amovie=aud/bg2.mp4 stays relative (no C:\ path).
-
-set "SCRIPT_DIR=%~dp0"
-if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-cd /d "%SCRIPT_DIR%"
-
-set "LIB_ROOT=C:\AKT Media Tools"
-set "SITE_PACKAGES=%LIB_ROOT%\Lib\site-packages"
-set "TEMP_INPUT=%TEMP%\akt_video_temp_input.mp4"
-set "TEMP_OUTPUT=%TEMP%\akt_video_temp_output.mp4"
-set "FILTER_AUDIO=%SCRIPT_DIR%\akt_filter_bg2.txt"
-set "FILTER_NOAUDIO=%SCRIPT_DIR%\akt_filter_bg2_noaudio.txt"
-set "LOG_FILE=%SCRIPT_DIR%\ffmpeg_log.txt"
-set "AUD_DIR=%SCRIPT_DIR%\aud"
-set "AUD_FILE=%AUD_DIR%\bg2.mp4"
-
-if exist "%SCRIPT_DIR%\_input" (set "INPUT_FOLDER=%SCRIPT_DIR%\_input") else (set "INPUT_FOLDER=%SCRIPT_DIR%\Input Folder")
-if exist "%SCRIPT_DIR%\_output" (set "OUTPUT_FOLDER=%SCRIPT_DIR%\_output") else (set "OUTPUT_FOLDER=%SCRIPT_DIR%\Output Folder")
-
-call :TestLibWrite
-if "!LIB_OK!"=="YES" goto :MAIN_START
-
-net session >nul 2>&1
-if %errorlevel% equ 0 (
-    echo.
-    echo  [ERROR] Cannot write to: %LIB_ROOT%
-    echo          Even as Administrator.
-    echo.
+:: Libraries only in C:\AKT Media Tools
+set "LIB=C:\AKT Media Tools"
+set "SITE=%LIB%\Lib\site-packages"
+if not exist "%SITE%" mkdir "%SITE%" 2>nul
+echo ok>"%SITE%\.write_test" 2>nul
+if not exist "%SITE%\.write_test" (
+    net session >nul 2>&1
+    if errorlevel 1 (
+        echo Need Administrator to create: %LIB%
+        powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+        exit /b
+    )
+    echo Cannot write to %LIB%
     pause
     exit /b 1
 )
+del "%SITE%\.write_test" 2>nul
 
-echo.
-echo  ============================================================
-echo  Administrator needed for library folder:
-echo    %LIB_ROOT%
-echo  Click YES on UAC prompt...
-echo  ============================================================
-echo.
-powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-exit /b
+if not exist "_input" mkdir "_input"
+if not exist "_output" mkdir "_output"
+if not exist "aud" mkdir "aud"
 
-:TestLibWrite
-set "LIB_OK=NO"
-if not exist "%SITE_PACKAGES%" mkdir "%SITE_PACKAGES%" 2>nul
-if not exist "%SITE_PACKAGES%" exit /b
-echo ok> "%SITE_PACKAGES%\.write_test" 2>nul
-if not exist "%SITE_PACKAGES%\.write_test" exit /b
-del "%SITE_PACKAGES%\.write_test" 2>nul
-set "LIB_OK=YES"
-net session >nul 2>&1
-if %errorlevel% equ 0 icacls "%LIB_ROOT%" /grant "%USERNAME%:(OI)(CI)F" /T /C >nul 2>&1
-exit /b
+where ffmpeg >nul 2>&1 || (echo FFmpeg not found in PATH.& pause & exit /b 1)
+if not exist "aud\bg2.mp4" (echo Put bg2.mp4 in the aud folder.& pause & exit /b 1)
 
-:MAIN_START
-echo.
-echo ============================================================
-echo   AKT VIDEO PROCESSOR
-echo   Effect: Flipped Moving Repeat (Series 2 - BG2)
-echo ============================================================
-echo.
-echo  [OK] Library folder writable
-echo.
-
-set "PYTHON="
-where py >nul 2>&1 && set "PYTHON=py"
-if not defined PYTHON where python >nul 2>&1 && set "PYTHON=python"
-if not defined PYTHON (
-    echo  [ERROR] Python not found in PATH.
-    pause
-    exit /b 1
-)
-echo  [OK] Python: %PYTHON%
-%PYTHON% --version 2>nul
-echo.
-
-echo  [~] Checking libraries...
-echo.
-set "NEED_PIL=NO"
-if not exist "%SITE_PACKAGES%\PIL" if not exist "%SITE_PACKAGES%\Pillow" set "NEED_PIL=YES"
-if "!NEED_PIL!"=="YES" (
-    echo  [..] Installing Pillow...
-    %PYTHON% -m pip install --upgrade --target "%SITE_PACKAGES%" Pillow >nul 2>&1
-    if !errorlevel! equ 0 (echo  [OK] Pillow) else (echo  [WARN] Pillow issue)
-) else (
-    echo  [OK] Pillow already installed
-)
-set "NEED_GENAI=NO"
-if not exist "%SITE_PACKAGES%\google" if not exist "%SITE_PACKAGES%\google_genai" set "NEED_GENAI=YES"
-if "!NEED_GENAI!"=="YES" (
-    echo  [..] Installing google-genai...
-    %PYTHON% -m pip install --upgrade --target "%SITE_PACKAGES%" google-genai >nul 2>&1
-    if !errorlevel! equ 0 (echo  [OK] google-genai) else (echo  [WARN] google-genai issue)
-) else (
-    echo  [OK] google-genai already installed
-)
-echo.
-
-where ffmpeg >nul 2>&1
-if %errorlevel% neq 0 (
-    echo  [ERROR] FFmpeg not found in PATH.
-    pause
-    exit /b 1
-)
-echo  [OK] FFmpeg found
-echo.
-
-if not exist "%FILTER_AUDIO%" (
-    echo  [ERROR] Missing filter file: %FILTER_AUDIO%
-    pause
-    exit /b 1
-)
-
-echo  [~] Checking folders...
-echo.
-if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: %INPUT_FOLDER%) else (echo  [OK] Input: %INPUT_FOLDER%)
-if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: %OUTPUT_FOLDER%) else (echo  [OK] Output: %OUTPUT_FOLDER%)
-if not exist "%AUD_DIR%" mkdir "%AUD_DIR%"
-
-:: Prefer original aud/bg2.mp4; otherwise copy from Audio to Add
-if not exist "%AUD_FILE%" if exist "%SCRIPT_DIR%\Audio to Add\bg2.mp4" copy /y "%SCRIPT_DIR%\Audio to Add\bg2.mp4" "%AUD_FILE%" >nul 2>&1
-
-set "USE_AUDIO=NO"
-if exist "%AUD_FILE%" (
-    echo  [OK] Audio: aud/bg2.mp4
-    set "USE_AUDIO=YES"
-) else (
-    echo  [WARN] aud/bg2.mp4 not found. Put bg2.mp4 in aud\  or in Audio to Add\
-    echo         Processing WITHOUT background audio.
-)
-echo.
-
-set "FILE_COUNT=0"
-for %%f in ("%INPUT_FOLDER%\*.*") do (
-    if exist "%%~f" if not exist "%%~f\" set /a FILE_COUNT+=1
-)
-if %FILE_COUNT% equ 0 (
-    echo  [ERROR] No files in: %INPUT_FOLDER%
-    pause
-    exit /b 1
-)
-echo  [OK] Found %FILE_COUNT% file(s) to process
-echo.
-
-if exist "%LOG_FILE%" del "%LOG_FILE%" >nul 2>&1
-
-echo ============================================================
-echo   STARTING VIDEO PROCESSING
-echo ============================================================
-echo.
-
-set /a PROCESSED=0
-set /a FAILED=0
-set "START_TIME=%time%"
-
-for %%t in ("%INPUT_FOLDER%\*.*") do (
+:: Copy each clip to _in.mp4 first. FFmpeg treats @ in the real filename
+:: as "read options from file". Encode is the original one-liner.
+for %%t in ("_input\*.*") do (
     if exist "%%~t" if not exist "%%~t\" (
-        echo  --------------------------------------------------------
-        echo  [~] Processing: %%~nxt
-        echo  --------------------------------------------------------
-
-        if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
-        if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
-
-        copy /y "%%~t" "%TEMP_INPUT%" >nul 2>&1
-
-        if not exist "%TEMP_INPUT%" (
-            echo  [FAIL] Cannot copy to temp file
-            set /a FAILED+=1
-            echo.
-        ) else (
-            if "!USE_AUDIO!"=="YES" (
-                ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -filter_complex_script "%FILTER_AUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >>"%LOG_FILE%" 2>&1
-            ) else (
-                ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -filter_complex_script "%FILTER_NOAUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >>"%LOG_FILE%" 2>&1
-            )
-
-            if exist "%TEMP_OUTPUT%" (
-                copy /y "%TEMP_OUTPUT%" "%OUTPUT_FOLDER%\%%~nt.mp4" >nul 2>&1
-            )
-
-            if exist "%OUTPUT_FOLDER%\%%~nt.mp4" (
-                echo  [OK] Done: %%~nt.mp4
-                set /a PROCESSED+=1
-            ) else (
-                echo  [FAIL] Failed: %%~nxt
-                echo         See: ffmpeg_log.txt
-                set /a FAILED+=1
-            )
-
-            if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
-            if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
-            echo.
-        )
+        echo Processing: %%~nxt
+        copy /y "%%~t" "_in.mp4" >nul
+        ffmpeg -y -i "_in.mp4" -ss 4 -i "_in.mp4" -filter_complex "[0:v]scale=iw:ih[v2];[1:v]crop=in_w/1.5:in_h/1.5:(in_w-out_w)/1.5+((in_w-out_w)/1.5)*sin(t*0.5):(in_h-out_h)/1.5 +((in_h-out_h)/1.5)*sin(t*0.2),boxblur=1:1,scale=iw*1.5:ih*1.5,hflip[v1];[v2][v1]overlay=1:enable='gte(mod(t,5),3)':x=0:y=0;[0:a]atempo=1,bass=frequency=200:gain=-90,volume=+20dB,aecho=1:0.6:2:0.4,bass=g=3:f=110:w=20,bass=g=10:f=500:w=20,bass=g=3:f=300:w=30,bass=g=10:f=110:w=20,bass=g=20:f=110:w=40,firequalizer=gain_entry='entry(0,-23);entry(250,-11.5);entry(6000,0);entry(12000,8);entry(16000,16)',compand=attacks=7:decays=1:points=-90/-90 -70/-60 -15/-15 0/-10:soft-knee=1:volume=-70:gain=3,pan=stereo| FL < FL + 0.5*FC + 0.6*BL + 0.6*SL | FR < FR + 2*FC + 1*BR + 2*SR,highpass=f=300,lowpass=f=700,volume=6[a1];amovie=aud/bg2.mp4:loop=9999,volume=1[a2];[a1][a2]amix=duration=shortest" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "_output\%%~nt.mp4"
+        del "_in.mp4" >nul 2>&1
     )
 )
 
-if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
-if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
-
-echo ============================================================
-echo   PROCESSING COMPLETE
-echo ============================================================
-echo.
-echo  Start Time  : %START_TIME%
-echo  End Time    : %time%
-echo  Processed   : %PROCESSED%
-echo  Failed      : %FAILED%
-echo  Input       : %INPUT_FOLDER%
-echo  Output      : %OUTPUT_FOLDER%
-echo  Audio       : %AUD_FILE%
-if %FAILED% gtr 0 (
-    echo.
-    echo  [!] FFmpeg errors saved to: ffmpeg_log.txt
-)
-echo.
-echo ============================================================
-echo.
+echo Done.
 pause
-exit /b
