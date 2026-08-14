@@ -8,24 +8,19 @@ title AKT Video Processor - Flipped Moving Repeat (Playlist Audio)
 :: ============================================================
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-cd /d "%SCRIPT_DIR%"
 
 set "INPUT_FOLDER=%SCRIPT_DIR%\Input Folder"
 set "OUTPUT_FOLDER=%SCRIPT_DIR%\Output Folder"
 set "AUDIO_FOLDER=%SCRIPT_DIR%\Audio to Add"
-set "FAILED_FOLDER=%SCRIPT_DIR%\_failed"
 set "LIB_ROOT=C:\AKT Media Tools"
 set "SITE_PACKAGES=%LIB_ROOT%\Lib\site-packages"
 
-:: Temp on SAME DRIVE as script (so Move-Item cannot fail across disks)
+:: Temp folders ON SAME DRIVE as script
 set "TEMP_DIR=%SCRIPT_DIR%\_akt_temp"
 set "TEMP_INPUT=%TEMP_DIR%\_input.mp4"
 set "TEMP_OUTPUT=%TEMP_DIR%\_output.mp4"
 set "CONCAT_FILE=%TEMP_DIR%\audio_concat.txt"
 set "NAME_FILE=%TEMP_DIR%\current_name.txt"
-set "FILTER_AUDIO=%SCRIPT_DIR%\akt_filter_playlist.txt"
-set "FILTER_NOAUDIO=%SCRIPT_DIR%\akt_filter_playlist_noaudio.txt"
-set "LOG_FILE=%SCRIPT_DIR%\ffmpeg_log.txt"
 
 :: ============================================================
 ::  SOFT UAC
@@ -98,7 +93,6 @@ if not exist "%SITE_PACKAGES%\PIL" if not exist "%SITE_PACKAGES%\Pillow" set "NE
 if "!NEED_PIL!"=="YES" (
     echo  [..] Installing Pillow...
     %PYTHON% -m pip install --upgrade --target "%SITE_PACKAGES%" Pillow >nul 2>&1
-    if !errorlevel! equ 0 (echo  [OK] Pillow) else (echo  [WARN] Pillow issue)
 ) else (
     echo  [OK] Pillow already installed
 )
@@ -107,7 +101,6 @@ if not exist "%SITE_PACKAGES%\google" if not exist "%SITE_PACKAGES%\google_genai
 if "!NEED_GENAI!"=="YES" (
     echo  [..] Installing google-genai...
     %PYTHON% -m pip install --upgrade --target "%SITE_PACKAGES%" google-genai >nul 2>&1
-    if !errorlevel! equ 0 (echo  [OK] google-genai) else (echo  [WARN] google-genai issue)
 ) else (
     echo  [OK] google-genai already installed
 )
@@ -123,39 +116,28 @@ if %errorlevel% neq 0 (
 echo  [OK] FFmpeg found
 echo.
 
-if not exist "%FILTER_AUDIO%" (
-    echo  [ERROR] Missing filter file: %FILTER_AUDIO%
-    pause
-    exit /b 1
-)
-
 :: --- Folders ---
 echo  [~] Checking folders...
 echo.
 if not exist "%INPUT_FOLDER%" (mkdir "%INPUT_FOLDER%" & echo  [+] Created: Input Folder) else (echo  [OK] Input Folder exists)
 if not exist "%OUTPUT_FOLDER%" (mkdir "%OUTPUT_FOLDER%" & echo  [+] Created: Output Folder) else (echo  [OK] Output Folder exists)
 if not exist "%AUDIO_FOLDER%" (mkdir "%AUDIO_FOLDER%" & echo  [+] Created: Audio to Add) else (echo  [OK] Audio to Add folder exists)
-if not exist "%FAILED_FOLDER%" mkdir "%FAILED_FOLDER%"
-if exist "%TEMP_DIR%" rmdir /s /q "%TEMP_DIR%" >nul 2>&1
-mkdir "%TEMP_DIR%"
+
+:: Create Temp Directory
+if not exist "%TEMP_DIR%" mkdir "%TEMP_DIR%"
 echo.
 
 :: --- Audio Setup (Looping Playlist) ---
-:: Copy to _audio_1.ext, _audio_2.ext so concat never sees @ # spaces
 echo  [~] Building Audio Playlist...
-set "USE_AUDIO=NO"
 set "AUDIO_COUNT=0"
-powershell -NoProfile -Command ^
-  "$td='%TEMP_DIR%'; $af='%AUDIO_FOLDER%'; $cf='%CONCAT_FILE%';" ^
-  "if (Test-Path -LiteralPath $cf) { Remove-Item -LiteralPath $cf -Force };" ^
-  "$i=0;" ^
-  "Get-ChildItem -LiteralPath $af -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {" ^
-  "  $i++; $dest = Join-Path $td ('_audio_' + $i + $_.Extension);" ^
-  "  Copy-Item -LiteralPath $_.FullName -Destination $dest -Force;" ^
-  "  Add-Content -LiteralPath $cf -Value ('file ' + [char]39 + ('_audio_' + $i + $_.Extension) + [char]39) -Encoding ascii" ^
-  "}" >nul 2>&1
+set "USE_AUDIO=NO"
+if exist "%CONCAT_FILE%" del "%CONCAT_FILE%" >nul 2>&1
 
-for /f "delims=" %%C in ('powershell -NoProfile -Command "$cf='%CONCAT_FILE%'; if (Test-Path -LiteralPath $cf) { @(Get-Content -LiteralPath $cf).Count } else { 0 }"') do set "AUDIO_COUNT=%%C"
+for %%a in ("%AUDIO_FOLDER%\*.*") do (
+    set /a AUDIO_COUNT+=1
+    copy /Y "%%a" "%TEMP_DIR%\_audio_!AUDIO_COUNT!%%~xa" >nul 2>&1
+    echo file '_audio_!AUDIO_COUNT!%%~xa' >> "%CONCAT_FILE%"
+)
 
 if !AUDIO_COUNT! gtr 0 (
     echo  [OK] Found !AUDIO_COUNT! audio file^(s^). Playlist created.
@@ -166,11 +148,11 @@ if !AUDIO_COUNT! gtr 0 (
 )
 echo.
 
-:: --- Count files (LiteralPath so @ # names are counted) ---
+:: --- Count files ---
 set "FILE_COUNT=0"
 for /f "delims=" %%C in ('powershell -NoProfile -Command "@(Get-ChildItem -LiteralPath '%INPUT_FOLDER%' -File).Count"') do set "FILE_COUNT=%%C"
 
-if "%FILE_COUNT%"=="0" (
+if %FILE_COUNT% equ 0 (
     echo  [ERROR] No files in: Input Folder
     pause
     exit /b 1
@@ -178,15 +160,8 @@ if "%FILE_COUNT%"=="0" (
 echo  [OK] Found %FILE_COUNT% video file(s) to process
 echo.
 
-if exist "%LOG_FILE%" del "%LOG_FILE%" >nul 2>&1
-
 :: ============================================================
 ::  PROCESS
-::  Move first remaining Input file to a safe temp name (queue).
-::  On success: save to Output with the original name, original gone.
-::  On fail: move original to _failed (do NOT put it back in Input,
-::  or the next loop would retry the same file forever).
-::  Filter graph is in a file so cmd.exe cannot treat | and < as pipe.
 :: ============================================================
 echo ============================================================
 echo   STARTING VIDEO PROCESSING
@@ -197,40 +172,41 @@ set /a PROCESSED=0
 set /a FAILED=0
 set "START_TIME=%time%"
 
+:: We process sequentially based on the file count, completely avoiding CMD string reading
 for /L %%N in (1, 1, %FILE_COUNT%) do (
     echo  --------------------------------------------------------
     echo  [~] Processing Video %%N of %FILE_COUNT%
     echo  --------------------------------------------------------
 
+    :: 1. Clean Staging
     if exist "%TEMP_INPUT%" del "%TEMP_INPUT%" >nul 2>&1
     if exist "%TEMP_OUTPUT%" del "%TEMP_OUTPUT%" >nul 2>&1
     if exist "%NAME_FILE%" del "%NAME_FILE%" >nul 2>&1
 
+    :: 2. Stage using PowerShell (Moves file out of Input to Temp, securely saves its original name)
     powershell -NoProfile -Command "$f = Get-ChildItem -LiteralPath '%INPUT_FOLDER%' -File | Select-Object -First 1; if ($f) { Move-Item -LiteralPath $f.FullName -Destination '%TEMP_INPUT%' -Force; [System.IO.File]::WriteAllText('%NAME_FILE%', $f.Name, [System.Text.Encoding]::UTF8) }" >nul 2>&1
 
     if not exist "%TEMP_INPUT%" (
         echo  [FAIL] Cannot stage file to temp folder. Skipping...
         set /a FAILED+=1
     ) else (
-        echo  [~] Encoding...
+        
+        :: 3. Process Video 
         if "!USE_AUDIO!"=="YES" (
-            pushd "%TEMP_DIR%"
-            ffmpeg -nostdin -y -i "_input.mp4" -ss 4 -i "_input.mp4" -stream_loop -1 -safe 0 -f concat -i "audio_concat.txt" -filter_complex_script "%FILTER_AUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "_output.mp4" >>"%LOG_FILE%" 2>&1
-            popd
+            ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -stream_loop -1 -safe 0 -f concat -i "%CONCAT_FILE%" -filter_complex "[0:v]scale=iw:ih[v2];[1:v]crop=in_w/1.5:in_h/1.5:(in_w-out_w)/1.5+((in_w-out_w)/1.5)*sin(t*0.5):(in_h-out_h)/1.5+((in_h-out_h)/1.5)*sin(t*0.2),boxblur=1:1,scale=iw*1.5:ih*1.5,hflip[v1];[v2][v1]overlay=1:enable='gte(mod(t,5),3)':x=0:y=0;[0:a]atempo=1,bass=frequency=200:gain=-90,volume=+20dB,aecho=1:0.6:2:0.4,bass=g=3:f=110:w=20,bass=g=10:f=500:w=20,bass=g=3:f=300:w=30,bass=g=10:f=110:w=20,bass=g=20:f=110:w=40,firequalizer=gain_entry='entry(0,-23);entry(250,-11.5);entry(6000,0);entry(12000,8);entry(16000,16)',compand=attacks=7:decays=1:points=-90/-90 -70/-60 -15/-15 0/-10:soft-knee=1:volume=-70:gain=3,pan=stereo| FL < FL + 0.5*FC + 0.6*BL + 0.6*SL | FR < FR + 2*FC + 1*BR + 2*SR,highpass=f=300,lowpass=f=700,volume=6[a1];[2:a]volume=1[a2];[a1][a2]amix=duration=shortest" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >nul 2>&1
         ) else (
-            pushd "%TEMP_DIR%"
-            ffmpeg -nostdin -y -i "_input.mp4" -ss 4 -i "_input.mp4" -filter_complex_script "%FILTER_NOAUDIO%" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "_output.mp4" >>"%LOG_FILE%" 2>&1
-            popd
+            ffmpeg -y -i "%TEMP_INPUT%" -ss 4 -i "%TEMP_INPUT%" -filter_complex "[0:v]scale=iw:ih[v2];[1:v]crop=in_w/1.5:in_h/1.5:(in_w-out_w)/1.5+((in_w-out_w)/1.5)*sin(t*0.5):(in_h-out_h)/1.5+((in_h-out_h)/1.5)*sin(t*0.2),boxblur=1:1,scale=iw*1.5:ih*1.5,hflip[v1];[v2][v1]overlay=1:enable='gte(mod(t,5),3)':x=0:y=0;[0:a]atempo=1,bass=frequency=200:gain=-90,volume=+20dB,aecho=1:0.6:2:0.4,bass=g=3:f=110:w=20,bass=g=10:f=500:w=20,bass=g=3:f=300:w=30,bass=g=10:f=110:w=20,bass=g=20:f=110:w=40,firequalizer=gain_entry='entry(0,-23);entry(250,-11.5);entry(6000,0);entry(12000,8);entry(16000,16)',compand=attacks=7:decays=1:points=-90/-90 -70/-60 -15/-15 0/-10:soft-knee=1:volume=-70:gain=3,pan=stereo| FL < FL + 0.5*FC + 0.6*BL + 0.6*SL | FR < FR + 2*FC + 1*BR + 2*SR,highpass=f=300,lowpass=f=700,volume=6" -vcodec libx264 -pix_fmt yuv420p -r 30 -g 60 -b:v 1550k -shortest -acodec aac -b:a 128k -ar 44100 -metadata title="" -metadata artist="" -metadata album_artist="" -metadata album="" -metadata date="" -metadata track="" -metadata genre="" -metadata publisher="" -metadata encoded_by="" -metadata copyright="" -metadata composer="" -metadata performer="" -metadata TIT1="" -metadata TIT3="" -metadata disc="" -metadata TKEY="" -metadata TBPM="" -metadata language="eng" -metadata encoder="" -threads 0 -preset ultrafast -crf 30 "%TEMP_OUTPUT%" >nul 2>&1
         )
 
+        :: 4. Move finished file to Output with EXACT original name
         if exist "%TEMP_OUTPUT%" (
-            powershell -NoProfile -Command "$name = [System.IO.File]::ReadAllText('%NAME_FILE%', [System.Text.Encoding]::UTF8).Trim(); Move-Item -LiteralPath '%TEMP_OUTPUT%' -Destination (Join-Path '%OUTPUT_FOLDER%' $name) -Force" >nul 2>&1
-            echo  [OK] Saved to Output Folder with original name.
+            powershell -NoProfile -Command "$name = [System.IO.File]::ReadAllText('%NAME_FILE%', [System.Text.Encoding]::UTF8); Move-Item -LiteralPath '%TEMP_OUTPUT%' -Destination (Join-Path '%OUTPUT_FOLDER%' $name) -Force" >nul 2>&1
+            echo  [OK] Saved exact original file to Output folder.
+            echo  [OK] Removed original from Input folder.
             set /a PROCESSED+=1
         ) else (
-            echo  [FAIL] FFmpeg failed. Original moved to _failed
-            echo         See: ffmpeg_log.txt
-            powershell -NoProfile -Command "$name = [System.IO.File]::ReadAllText('%NAME_FILE%', [System.Text.Encoding]::UTF8).Trim(); if (Test-Path -LiteralPath '%TEMP_INPUT%') { Move-Item -LiteralPath '%TEMP_INPUT%' -Destination (Join-Path '%FAILED_FOLDER%' $name) -Force }" >nul 2>&1
+            echo  [FAIL] FFmpeg failed. Restoring original file to Input...
+            powershell -NoProfile -Command "$name = [System.IO.File]::ReadAllText('%NAME_FILE%', [System.Text.Encoding]::UTF8); Move-Item -LiteralPath '%TEMP_INPUT%' -Destination (Join-Path '%INPUT_FOLDER%' $name) -Force" >nul 2>&1
             set /a FAILED+=1
         )
     )
@@ -238,12 +214,8 @@ for /L %%N in (1, 1, %FILE_COUNT%) do (
 )
 
 :: ============================================================
-::  CLEANUP  (never delete _input.mp4 if a file is still staged)
+::  CLEANUP
 :: ============================================================
-if exist "%TEMP_INPUT%" (
-    echo  [!] Leftover staged file found. Moving to _failed...
-    powershell -NoProfile -Command "$name = 'recovered.mp4'; if (Test-Path -LiteralPath '%NAME_FILE%') { $name = [System.IO.File]::ReadAllText('%NAME_FILE%', [System.Text.Encoding]::UTF8).Trim() }; Move-Item -LiteralPath '%TEMP_INPUT%' -Destination (Join-Path '%FAILED_FOLDER%' $name) -Force" >nul 2>&1
-)
 timeout /t 1 /nobreak >nul
 if exist "%TEMP_DIR%" rmdir /s /q "%TEMP_DIR%" >nul 2>&1
 
@@ -260,11 +232,6 @@ echo  Processed   : %PROCESSED%
 echo  Failed      : %FAILED%
 echo  Input       : %INPUT_FOLDER%
 echo  Output      : %OUTPUT_FOLDER%
-echo  Audio       : %AUDIO_FOLDER%
-if %FAILED% gtr 0 (
-    echo  Failed dir  : %FAILED_FOLDER%
-    echo  FFmpeg log  : %LOG_FILE%
-)
 echo.
 echo ============================================================
 echo.
