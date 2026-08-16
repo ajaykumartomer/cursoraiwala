@@ -373,13 +373,30 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
             stamp.id = 'akt-saved-stamp';
             stamp.innerText = "Post_Saved_On : " + ts;
             stamp.style.fontFamily = "Arial, Helvetica, sans-serif";
-            stamp.style.fontWeight = "bold";
-            stamp.style.fontSize = "8pt";
+            stamp.style.fontWeight = "800";
+            stamp.style.fontSize = "7pt";
             stamp.style.whiteSpace = "nowrap";
-            stamp.style.color = "#000";
-            stamp.style.marginLeft = "auto";
-            stamp.style.paddingLeft = "12px";
+            stamp.style.setProperty("color", "#000000", "important");
+            stamp.style.setProperty("-webkit-text-fill-color", "#000000", "important");
+            stamp.style.marginLeft = "8px";
+            stamp.style.marginRight = "10px";
+            stamp.style.paddingLeft = "0";
+            stamp.style.paddingRight = "2px";
             stamp.style.flexShrink = "0";
+            stamp.style.overflow = "visible";
+            stamp.style.lineHeight = "1.2";
+
+            const fitStamp = (row) => {
+                row.style.overflow = "visible";
+                if (row.parentElement) row.parentElement.style.overflow = "visible";
+                let size = 7;
+                stamp.style.fontSize = size + "pt";
+                const rightLimit = () => row.getBoundingClientRect().right - 8;
+                while (size > 5 && stamp.getBoundingClientRect().right > rightLimit()) {
+                    size -= 0.25;
+                    stamp.style.fontSize = size + "pt";
+                }
+            };
 
             let viewMore = null;
             document.querySelectorAll('a, span, p, div').forEach(el => {
@@ -394,7 +411,10 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
                     row.style.alignItems = "center";
                     row.style.justifyContent = "space-between";
                     row.style.width = "100%";
+                    row.style.boxSizing = "border-box";
+                    row.style.paddingRight = "8px";
                     row.appendChild(stamp);
+                    fitStamp(row);
                     return;
                 }
             }
@@ -413,6 +433,8 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
                     stamp.style.display = "flex";
                     stamp.style.alignItems = "center";
                     stamp.style.justifyContent = "flex-end";
+                    stamp.style.setProperty("color", "#000000", "important");
+                    stamp.style.setProperty("-webkit-text-fill-color", "#000000", "important");
                     mainRow.insertBefore(stamp, rightWrapper);
                     return;
                 }
