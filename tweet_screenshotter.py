@@ -12,8 +12,25 @@ from pathlib import Path
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-TWEET_SELECTOR = 'article[data-testid="tweet"]'
-ENGAGEMENT_SELECTOR = '[data-testid="reply"], [data-testid="retweet"], [data-testid="like"]'
+# X has shipped both the classic React UI and a newer article markup.
+TWEET_SELECTOR = ",".join(
+    [
+        'article[data-testid="tweet"]',
+        "article[data-tweet-id]",
+        'article[itemtype="https://schema.org/SocialMediaPosting"]',
+    ]
+)
+ENGAGEMENT_SELECTOR = ",".join(
+    [
+        '[data-testid="reply"]',
+        '[data-testid="retweet"]',
+        '[data-testid="like"]',
+        'button[aria-label="Reply"]',
+        'button[aria-label="Repost"]',
+        'button[aria-label="Like"]',
+        'button[aria-label="Share"]',
+    ]
+)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -26,9 +43,14 @@ def normalize_tweet_url(url: str) -> str:
     return url
 
 
-def filename_from_url(url: str) -> str:
+def tweet_id_from_url(url: str) -> str | None:
     match = re.search(r"status/(\d+)", url)
-    return f"tweet_{match.group(1)}.png" if match else "tweet_screenshot.png"
+    return match.group(1) if match else None
+
+
+def filename_from_url(url: str) -> str:
+    tweet_id = tweet_id_from_url(url)
+    return f"tweet_{tweet_id}.png" if tweet_id else "tweet_screenshot.png"
 
 
 async def dismiss_overlays(page) -> None:
@@ -69,6 +91,15 @@ async def dismiss_overlays(page) -> None:
                 if (style.position === 'fixed' || Number(style.zIndex) >= 1) {
                     hide(layer);
                 }
+            });
+            document.querySelectorAll('button, a, div').forEach((el) => {
+                const text = (el.textContent || '').trim();
+                if (text.startsWith('Continue to X') || text.includes('Scan to get the app')) {
+                    hide(el);
+                }
+            });
+            document.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]').forEach((el) => {
+                if (el.tagName !== 'ARTICLE') hide(el);
             });
         }
         """
@@ -135,10 +166,22 @@ async def capture_tweet(url: str, output_filename: str = "tweet_screenshot.png")
                 print("Navigation timed out; continuing with whatever loaded.")
 
             print("Waiting for the tweet to render...")
-            await page.wait_for_selector(TWEET_SELECTOR, state="visible", timeout=25000)
+            tweet_id = tweet_id_from_url(url)
+            specific = f'article[data-tweet-id="{tweet_id}"]' if tweet_id else None
+            await page.wait_for_selector(
+                f"{specific}, {TWEET_SELECTOR}" if specific else TWEET_SELECTOR,
+                state="visible",
+                timeout=25000,
+            )
             await dismiss_overlays(page)
 
-            tweet = page.locator(TWEET_SELECTOR).first
+            tweet = (
+                page.locator(specific).first
+                if specific
+                else page.locator(TWEET_SELECTOR).first
+            )
+            if specific and await tweet.count() == 0:
+                tweet = page.locator(TWEET_SELECTOR).first
             await tweet.wait_for(state="visible", timeout=10000)
             await tweet.scroll_into_view_if_needed()
 
@@ -154,25 +197,12 @@ async def capture_tweet(url: str, output_filename: str = "tweet_screenshot.png")
             await asyncio.sleep(1.5)
             await dismiss_overlays(page)
 
-            box = await tweet.bounding_box()
-            if not box:
-                raise RuntimeError("Could not measure the tweet element.")
-
-            # Pad so the avatar, rounded media corners, and share icons
-            # are not clipped at the article edges.
-            pad = 8
-            clip = {
-                "x": max(box["x"] - pad, 0),
-                "y": max(box["y"] - pad, 0),
-                "width": box["width"] + pad * 2,
-                "height": box["height"] + pad * 2,
-            }
-
             print("Capturing screenshot of the full tweet (username through likes/share)...")
-            await page.screenshot(
+            # Element screenshot captures the full article even if it is taller
+            # than the viewport (media + engagement bar included).
+            await tweet.screenshot(
                 path=str(output_path),
                 type="png",
-                clip=clip,
                 animations="disabled",
             )
 
