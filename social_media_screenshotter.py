@@ -520,7 +520,7 @@ async def new_mobile_context(browser, user_agent: str, ig_cookies=None):
                 print(f"    [!] Some cookies could not be applied: {cookie_err}")
     return context
 
-async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str) -> list:
+async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str, timestamp_display: str) -> list:
     """Load IG, screenshot slides, return saved file paths."""
     saved_paths = []
     print("[+] Waiting for Instagram media to paint...")
@@ -596,7 +596,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str)
     print(f"[+] Username identified: @{ig_username}")
 
     print("[+] Injecting perfectly aligned 8pt Bold Timestamp...")
-    await inject_instagram_timestamp(page, timestamp_str)
+    await inject_instagram_timestamp(page, timestamp_display)
     await hide_instagram_below_actions(page)
 
     element = await pick_instagram_element(page)
@@ -674,7 +674,9 @@ async def capture_post(url: str):
         print("\n❌ ERROR: Please enter a valid X/Twitter or Instagram URL.")
         return
 
-    timestamp_str = datetime.now().strftime("%d_%b_%Y_%H%M")
+    now = datetime.now()
+    timestamp_str = now.strftime("%d_%b_%Y_%H%M")
+    timestamp_display = now.strftime("%d_%b_%Y_%H:%M")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "Social Media Screenshots")
     os.makedirs(output_dir, exist_ok=True)
@@ -734,7 +736,7 @@ async def capture_post(url: str):
                         parent.appendChild(stamp);
                     }
                 }""",
-                    timestamp_str,
+                    timestamp_display,
                 )
 
                 output_path = os.path.join(output_dir, f"{filename_base}.png")
@@ -747,7 +749,7 @@ async def capture_post(url: str):
             # INSTAGRAM LOGIC — Firefox first
             # =================================================================
             else:
-                saved_paths = await capture_instagram(page, url, output_dir, timestamp_str)
+                saved_paths = await capture_instagram(page, url, output_dir, timestamp_str, timestamp_display)
                 still_blank = saved_paths and all(screenshot_looks_blank(p) for p in saved_paths)
 
                 if still_blank:
@@ -760,7 +762,7 @@ async def capture_post(url: str):
                     browser = await launch_installed_chrome_family(p)
                     context = await new_mobile_context(browser, S24_CHROME_UA, ig_cookies)
                     page = await context.new_page()
-                    saved_paths = await capture_instagram(page, url, output_dir, timestamp_str)
+                    saved_paths = await capture_instagram(page, url, output_dir, timestamp_str, timestamp_display)
 
                 print(f"\n✅ SUCCESS! Mobile Screenshot(s) securely saved to: {output_dir}")
 
