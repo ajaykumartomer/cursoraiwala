@@ -457,41 +457,39 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
     )
 
 async def hide_instagram_below_actions(page):
-    """Keep header, image, timestamp, like/comment/share, and likes. Hide the rest below."""
+    """Keep like/share/likes; hide caption, comments, and Add a comment (Gemini crop)."""
     try:
         await page.evaluate(
             """() => {
-                const root = document.querySelector('div.Embed, article') || document.body;
-                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
-                let cut = 0;
-                labs.forEach(lab => {
-                    root.querySelectorAll('svg[aria-label="' + lab + '"]').forEach(s => {
-                        cut = Math.max(cut, s.getBoundingClientRect().bottom);
-                    });
-                });
-                if (!cut) return;
-                const likeRe = /^[\\d,.\\s]+likes$/i;
-                root.querySelectorAll('span, a, div, section').forEach(node => {
-                    const own = Array.from(node.childNodes)
-                        .filter(n => n.nodeType === 3)
-                        .map(n => (n.textContent || '').trim())
-                        .join(' ')
-                        .trim();
-                    const t = (own || (node.children.length === 0 ? (node.innerText || '').trim() : ''))
-                        .replace(/\\s+/g, ' ');
-                    if (!likeRe.test(t)) return;
-                    const r = node.getBoundingClientRect();
-                    if (r.top >= cut - 12 && r.top <= cut + 70 && r.height < 48) {
-                        cut = Math.max(cut, r.bottom);
+                const hide = (el) => {
+                    if (el) el.style.setProperty('display', 'none', 'important');
+                };
+
+                document.querySelectorAll(
+                    '.Caption, .CaptionText, .Comments, .EmbedComments, .embedComment'
+                ).forEach(hide);
+
+                const heartSvg = document.querySelector(
+                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
+                );
+                if (heartSvg) {
+                    const btn = heartSvg.closest('div[role="button"], button, a') || heartSvg.parentElement;
+                    const actionRow = btn && btn.parentElement;
+                    const targetFeedback = actionRow && actionRow.parentElement;
+                    if (targetFeedback) {
+                        let sibling = targetFeedback.nextElementSibling;
+                        while (sibling) {
+                            hide(sibling);
+                            sibling = sibling.nextElementSibling;
+                        }
                     }
-                });
-                const cutoff = cut + 16;
-                root.querySelectorAll('*').forEach(el => {
-                    if (el.id === 'akt-saved-stamp') return;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 2 || r.height < 2) return;
-                    if (r.top >= cutoff) {
-                        el.style.setProperty('display', 'none', 'important');
+                }
+
+                document.querySelectorAll('form, section, footer, div, span, textarea, p').forEach(el => {
+                    const t = ((el.innerText || el.getAttribute('placeholder') || '') + '')
+                        .replace(/\\s+/g, ' ').trim();
+                    if (/^add a comment/i.test(t) || /^view all \\d+ comments/i.test(t)) {
+                        hide(el.closest('form, footer, section') || el);
                     }
                 });
             }"""
@@ -500,18 +498,22 @@ async def hide_instagram_below_actions(page):
         pass
 
 async def instagram_crop_clip(element):
-    """Clip the PNG so it ends just below like/comment/share (and likes)."""
+    """Clip PNG to bottom of like/share row plus likes, excluding Add a comment."""
     try:
         clip = await element.evaluate(
             """(el) => {
                 const rootRect = el.getBoundingClientRect();
-                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
-                let cut = 0;
-                labs.forEach(lab => {
-                    el.querySelectorAll('svg[aria-label="' + lab + '"]').forEach(s => {
-                        cut = Math.max(cut, s.getBoundingClientRect().bottom);
-                    });
-                });
+                const heartSvg = el.querySelector(
+                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
+                ) || document.querySelector(
+                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
+                );
+                if (!heartSvg) return null;
+
+                const btn = heartSvg.closest('div[role="button"], button, a') || heartSvg.parentElement;
+                const actionRow = btn && btn.parentElement;
+                let cut = (actionRow || heartSvg).getBoundingClientRect().bottom;
+
                 const likeRe = /^[\\d,.\\s]+likes$/i;
                 el.querySelectorAll('span, a, div').forEach(node => {
                     const own = Array.from(node.childNodes)
@@ -523,17 +525,22 @@ async def instagram_crop_clip(element):
                         .replace(/\\s+/g, ' ');
                     if (!likeRe.test(t)) return;
                     const r = node.getBoundingClientRect();
-                    if (cut && r.top >= cut - 12 && r.top <= cut + 70 && r.height < 48) {
+                    if (r.top >= cut - 16 && r.top <= cut + 80 && r.height < 48) {
                         cut = Math.max(cut, r.bottom);
                     }
                 });
-                if (!cut) return null;
-                const height = Math.min(rootRect.height, Math.max(80, cut - rootRect.top + 16));
+
+                const height = Math.min(
+                    rootRect.height - 1,
+                    Math.max(80, cut - rootRect.top + 10)
+                );
+                const width = Math.max(1, rootRect.width - 1);
+                if (height < 80 || width < 40) return null;
                 return {
                     x: 0,
                     y: 0,
-                    width: Math.max(1, Math.round(rootRect.width)),
-                    height: Math.max(1, Math.round(height))
+                    width: Math.floor(width),
+                    height: Math.floor(height)
                 };
             }"""
         )
@@ -667,8 +674,11 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
             box = await element.bounding_box()
             if not box or box["height"] < 80:
                 element = await pick_instagram_element(page)
+                box = await element.bounding_box()
             clip = await instagram_crop_clip(element)
-            if clip:
+            if clip and box:
+                clip["width"] = max(1, min(int(clip["width"]), int(box["width"])))
+                clip["height"] = max(1, min(int(clip["height"]), int(box["height"])))
                 await element.screenshot(path=output_path, animations="disabled", clip=clip)
             else:
                 await element.screenshot(path=output_path, animations="disabled")
@@ -676,27 +686,22 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
             await element.screenshot(path=output_path, animations="disabled")
 
         if screenshot_looks_blank(output_path):
-            print("    [!] Capture looked blank — retrying as a full-page shot...")
+            print("    [!] Capture looked blank — retrying cropped shot...")
             await page.wait_for_timeout(1500)
             await prepare_instagram_media(page)
             await hide_instagram_below_actions(page)
             try:
                 element = await pick_instagram_element(page)
+                box = await element.bounding_box()
                 clip = await instagram_crop_clip(element)
-                if clip:
+                if clip and box:
+                    clip["width"] = max(1, min(int(clip["width"]), int(box["width"])))
+                    clip["height"] = max(1, min(int(clip["height"]), int(box["height"])))
                     await element.screenshot(path=output_path, animations="disabled", clip=clip)
                 else:
                     await element.screenshot(path=output_path, animations="disabled")
             except Exception:
                 pass
-            if screenshot_looks_blank(output_path):
-                clip = await instagram_crop_clip(element)
-                if clip:
-                    await element.screenshot(path=output_path, animations="disabled", clip=clip)
-                else:
-                    await page.screenshot(
-                        path=output_path, full_page=True, animations="disabled"
-                    )
 
         saved_paths.append(output_path)
 
