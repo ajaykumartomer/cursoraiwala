@@ -369,9 +369,6 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
             const existing = document.getElementById('akt-saved-stamp');
             if (existing) existing.remove();
 
-            const svgs = document.querySelectorAll(
-                'svg[aria-label="Save"], svg[aria-label="Remove"]'
-            );
             const stamp = document.createElement('div');
             stamp.id = 'akt-saved-stamp';
             stamp.innerText = "Post_Saved_On : " + ts;
@@ -379,7 +376,32 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
             stamp.style.fontWeight = "bold";
             stamp.style.fontSize = "8pt";
             stamp.style.whiteSpace = "nowrap";
+            stamp.style.color = "#000";
+            stamp.style.marginLeft = "auto";
+            stamp.style.paddingLeft = "12px";
+            stamp.style.flexShrink = "0";
 
+            let viewMore = null;
+            document.querySelectorAll('a, span, p, div').forEach(el => {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (/^view more on instagram$/i.test(t)) viewMore = el;
+            });
+            if (viewMore) {
+                const row = viewMore.closest('p') || viewMore.parentElement;
+                if (row) {
+                    row.style.display = "flex";
+                    row.style.flexDirection = "row";
+                    row.style.alignItems = "center";
+                    row.style.justifyContent = "space-between";
+                    row.style.width = "100%";
+                    row.appendChild(stamp);
+                    return;
+                }
+            }
+
+            const svgs = document.querySelectorAll(
+                'svg[aria-label="Save"], svg[aria-label="Remove"]'
+            );
             if (svgs.length > 0) {
                 const btn = svgs[0].closest('div[role="button"]') || svgs[0].parentElement;
                 const rightWrapper = btn ? btn.parentElement : null;
@@ -391,7 +413,6 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
                     stamp.style.display = "flex";
                     stamp.style.alignItems = "center";
                     stamp.style.justifyContent = "flex-end";
-                    stamp.style.color = "#000";
                     mainRow.insertBefore(stamp, rightWrapper);
                     return;
                 }
@@ -400,7 +421,6 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
             stamp.style.position = "absolute";
             stamp.style.bottom = "12px";
             stamp.style.right = "12px";
-            stamp.style.color = "#000";
             stamp.style.background = "rgba(255,255,255,0.85)";
             stamp.style.padding = "2px 6px";
             stamp.style.borderRadius = "4px";
@@ -413,6 +433,45 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
         }""",
         timestamp_str,
     )
+
+async def hide_instagram_below_actions(page):
+    """Drop likes/caption/comments so the shot ends at like/comment/share."""
+    try:
+        await page.evaluate(
+            """() => {
+                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
+                let icon = null;
+                for (const lab of labs) {
+                    icon = document.querySelector('svg[aria-label="' + lab + '"]');
+                    if (icon) break;
+                }
+                if (!icon) return;
+                let row = icon;
+                for (let i = 0; i < 10; i++) {
+                    const p = row.parentElement;
+                    if (!p) break;
+                    const h = p.getBoundingClientRect().height;
+                    const n = p.querySelectorAll(
+                        'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Comment"], svg[aria-label="Share"], svg[aria-label="Share Post"], svg[aria-label="Save"]'
+                    ).length;
+                    if (n >= 3 && h <= 80) { row = p; break; }
+                    row = p;
+                }
+                const root = document.querySelector('div.Embed, article') || document.body;
+                let cur = row;
+                while (cur && cur !== root) {
+                    let sib = cur.nextElementSibling;
+                    while (sib) {
+                        const nxt = sib.nextElementSibling;
+                        sib.style.setProperty('display', 'none', 'important');
+                        sib = nxt;
+                    }
+                    cur = cur.parentElement;
+                }
+            }"""
+        )
+    except Exception:
+        pass
 
 # ============================================================================
 # 6. SOCIAL MEDIA SCREENSHOTTER (MOBILE VIEWPORT)
@@ -475,6 +534,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str)
 
     ig_username = await page.evaluate(
         """() => {
+        const ok = (t) => /^[A-Za-z0-9._]+$/.test(t) && t.toLowerCase() !== 'instagram';
         let iosUrl = document.querySelector('meta[property="al:ios:url"]');
         if (iosUrl && iosUrl.content && iosUrl.content.includes('username=')) {
             return iosUrl.content.split('username=')[1].split('&')[0];
@@ -486,19 +546,36 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str)
             let match2 = ogTitle.content.match(/^([a-zA-Z0-9_.]+)\\s+on Instagram/);
             if (match2) return match2[1];
         }
-        let headerLinks = document.querySelectorAll('header a');
+        let header = document.querySelector('header');
+        if (header) {
+            let first = header.innerText.trim().split('\\n')[0].trim();
+            if (ok(first)) return first;
+        }
+        let headerLinks = document.querySelectorAll('header a, header span, header strong');
         for (let a of headerLinks) {
-            let text = a.innerText.trim();
-            if (text && !text.includes(' ') && !text.includes('\\n')) return text;
+            let text = (a.innerText || '').trim().split('\\n')[0].trim();
+            if (ok(text)) return text;
+        }
+        for (let a of document.querySelectorAll('a[href]')) {
+            let href = a.getAttribute('href') || '';
+            let m = href.match(/instagram\\.com\\/([A-Za-z0-9._]+)\\/?$/);
+            if (m && ok(m[1]) && !['p','reel','reels','tv','stories','accounts'].includes(m[1])) return m[1];
+            let text = (a.innerText || '').trim().split('\\n')[0].trim();
+            if (ok(text) && a.closest('header, .Header, .EmbedHeader')) return text;
         }
         return 'unknown';
     }"""
     )
+    if ig_username == "unknown":
+        m = re.search(r"instagram\.com/([A-Za-z0-9._]+)/(?:p|reel|reels|tv)/", url, re.I)
+        if m and m.group(1).lower() not in {"p", "reel", "reels", "tv", "stories"}:
+            ig_username = m.group(1)
     filename_base = f"instagram.com_@{ig_username}_{timestamp_str}"
     print(f"[+] Username identified: @{ig_username}")
 
     print("[+] Injecting perfectly aligned 8pt Bold Timestamp...")
     await inject_instagram_timestamp(page, timestamp_str)
+    await hide_instagram_below_actions(page)
 
     element = await pick_instagram_element(page)
 
@@ -513,6 +590,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str)
 
         print(f"[+] Taking tight crop screenshot... Saving as {current_filename}")
         await prepare_instagram_media(page)
+        await hide_instagram_below_actions(page)
         await page.wait_for_timeout(400)
 
         try:
@@ -545,6 +623,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str)
             await next_btn.click()
             await page.wait_for_timeout(1500)
             await prepare_instagram_media(page)
+            await hide_instagram_below_actions(page)
             await wait_for_instagram_media(page, timeout_ms=8000)
 
             if slide_num == 1:
