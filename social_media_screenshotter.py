@@ -457,43 +457,91 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
     )
 
 async def hide_instagram_below_actions(page):
-    """Drop likes/caption/comments so the shot ends at like/comment/share."""
+    """Keep header, image, timestamp, like/comment/share, and likes. Hide the rest below."""
     try:
         await page.evaluate(
             """() => {
-                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
-                let icon = null;
-                for (const lab of labs) {
-                    icon = document.querySelector('svg[aria-label="' + lab + '"]');
-                    if (icon) break;
-                }
-                if (!icon) return;
-                let row = icon;
-                for (let i = 0; i < 10; i++) {
-                    const p = row.parentElement;
-                    if (!p) break;
-                    const h = p.getBoundingClientRect().height;
-                    const n = p.querySelectorAll(
-                        'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Comment"], svg[aria-label="Share"], svg[aria-label="Share Post"], svg[aria-label="Save"]'
-                    ).length;
-                    if (n >= 3 && h <= 80) { row = p; break; }
-                    row = p;
-                }
                 const root = document.querySelector('div.Embed, article') || document.body;
-                let cur = row;
-                while (cur && cur !== root) {
-                    let sib = cur.nextElementSibling;
-                    while (sib) {
-                        const nxt = sib.nextElementSibling;
-                        sib.style.setProperty('display', 'none', 'important');
-                        sib = nxt;
+                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
+                let cut = 0;
+                labs.forEach(lab => {
+                    root.querySelectorAll('svg[aria-label="' + lab + '"]').forEach(s => {
+                        cut = Math.max(cut, s.getBoundingClientRect().bottom);
+                    });
+                });
+                if (!cut) return;
+                const likeRe = /^[\\d,.\\s]+likes$/i;
+                root.querySelectorAll('span, a, div, section').forEach(node => {
+                    const own = Array.from(node.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => (n.textContent || '').trim())
+                        .join(' ')
+                        .trim();
+                    const t = (own || (node.children.length === 0 ? (node.innerText || '').trim() : ''))
+                        .replace(/\\s+/g, ' ');
+                    if (!likeRe.test(t)) return;
+                    const r = node.getBoundingClientRect();
+                    if (r.top >= cut - 12 && r.top <= cut + 70 && r.height < 48) {
+                        cut = Math.max(cut, r.bottom);
                     }
-                    cur = cur.parentElement;
-                }
+                });
+                const cutoff = cut + 16;
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.id === 'akt-saved-stamp') return;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return;
+                    if (r.top >= cutoff) {
+                        el.style.setProperty('display', 'none', 'important');
+                    }
+                });
             }"""
         )
     except Exception:
         pass
+
+async def instagram_crop_clip(element):
+    """Clip the PNG so it ends just below like/comment/share (and likes)."""
+    try:
+        clip = await element.evaluate(
+            """(el) => {
+                const rootRect = el.getBoundingClientRect();
+                const labs = ['Like','Unlike','Comment','Share','Share Post','Save','Remove'];
+                let cut = 0;
+                labs.forEach(lab => {
+                    el.querySelectorAll('svg[aria-label="' + lab + '"]').forEach(s => {
+                        cut = Math.max(cut, s.getBoundingClientRect().bottom);
+                    });
+                });
+                const likeRe = /^[\\d,.\\s]+likes$/i;
+                el.querySelectorAll('span, a, div').forEach(node => {
+                    const own = Array.from(node.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => (n.textContent || '').trim())
+                        .join(' ')
+                        .trim();
+                    const t = (own || (node.children.length === 0 ? (node.innerText || '').trim() : ''))
+                        .replace(/\\s+/g, ' ');
+                    if (!likeRe.test(t)) return;
+                    const r = node.getBoundingClientRect();
+                    if (cut && r.top >= cut - 12 && r.top <= cut + 70 && r.height < 48) {
+                        cut = Math.max(cut, r.bottom);
+                    }
+                });
+                if (!cut) return null;
+                const height = Math.min(rootRect.height, Math.max(80, cut - rootRect.top + 16));
+                return {
+                    x: 0,
+                    y: 0,
+                    width: Math.max(1, Math.round(rootRect.width)),
+                    height: Math.max(1, Math.round(height))
+                };
+            }"""
+        )
+        if clip and clip.get("width") and clip.get("height"):
+            return clip
+    except Exception:
+        pass
+    return None
 
 # ============================================================================
 # 6. SOCIAL MEDIA SCREENSHOTTER (MOBILE VIEWPORT)
@@ -619,23 +667,36 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
             box = await element.bounding_box()
             if not box or box["height"] < 80:
                 element = await pick_instagram_element(page)
-            await element.screenshot(path=output_path, animations="disabled")
+            clip = await instagram_crop_clip(element)
+            if clip:
+                await element.screenshot(path=output_path, animations="disabled", clip=clip)
+            else:
+                await element.screenshot(path=output_path, animations="disabled")
         except Exception:
-            await page.screenshot(path=output_path, full_page=True, animations="disabled")
+            await element.screenshot(path=output_path, animations="disabled")
 
         if screenshot_looks_blank(output_path):
             print("    [!] Capture looked blank — retrying as a full-page shot...")
             await page.wait_for_timeout(1500)
             await prepare_instagram_media(page)
+            await hide_instagram_below_actions(page)
             try:
                 element = await pick_instagram_element(page)
-                await element.screenshot(path=output_path, animations="disabled")
+                clip = await instagram_crop_clip(element)
+                if clip:
+                    await element.screenshot(path=output_path, animations="disabled", clip=clip)
+                else:
+                    await element.screenshot(path=output_path, animations="disabled")
             except Exception:
                 pass
             if screenshot_looks_blank(output_path):
-                await page.screenshot(
-                    path=output_path, full_page=True, animations="disabled"
-                )
+                clip = await instagram_crop_clip(element)
+                if clip:
+                    await element.screenshot(path=output_path, animations="disabled", clip=clip)
+                else:
+                    await page.screenshot(
+                        path=output_path, full_page=True, animations="disabled"
+                    )
 
         saved_paths.append(output_path)
 
