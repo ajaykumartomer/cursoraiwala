@@ -23,10 +23,13 @@ PW_BROWSERS = os.path.join(TOOLS_DIR, "pw-browsers")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PW_BROWSERS
 
 S24_VIEWPORT = {"width": 412, "height": 915}
-S24_UA = (
+S24_CHROME_UA = (
     "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36"
 )
+# Match Playwright Firefox so Instagram does not get Chrome-only JS that paints blank.
+S24_FIREFOX_UA = "Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0"
+S24_UA = S24_CHROME_UA
 IG_SHORTCODE_RE = re.compile(
     r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)",
     re.IGNORECASE,
@@ -125,15 +128,6 @@ def prepare_environment():
     else:
         print("[OK] Firefox browser binaries already present.")
 
-    # Instagram's web app often paints a blank frame in headless Firefox.
-    # Chromium is used only for Instagram; Twitter keeps the working Firefox path.
-    if not _has_browser_dir("chromium"):
-        print("[-] Downloading Playwright Chromium browser binaries (needed for Instagram)...")
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], env=env)
-        print("[OK] Chromium binaries installed.")
-    else:
-        print("[OK] Chromium browser binaries already present.")
-
 # ============================================================================
 # 4. INSTAGRAM CACHE/COOKIE EXTRACTOR
 # ============================================================================
@@ -175,7 +169,7 @@ def get_instagram_cookies():
                     "value": c.value,
                     "domain": cookie_domain,
                     "path": c.path or "/",
-                    "secure": bool(c.secure) or True,
+                    "secure": True,
                     "httpOnly": c.name in {"sessionid", "rur", "mid"},
                     "sameSite": "Lax",
                 }
@@ -317,6 +311,47 @@ async def pick_instagram_element(page):
             continue
     return best or page.locator("body")
 
+def _windows_browser_exe(*relative_parts: str) -> list:
+    bases = [
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        os.environ.get("LOCALAPPDATA", ""),
+    ]
+    found = []
+    for base in bases:
+        if not base:
+            continue
+        path = os.path.join(base, *relative_parts)
+        if os.path.isfile(path):
+            found.append(path)
+    return found
+
+async def launch_installed_chrome_family(playwright):
+    """Use Chrome / Brave / Edge already on the PC. Never download Playwright Chromium."""
+    chromium = playwright.chromium
+    launch_args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
+
+    for channel, label in (("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")):
+        try:
+            browser = await chromium.launch(headless=True, channel=channel, args=launch_args)
+            print(f"[+] Using installed {label} (no Chromium download).")
+            return browser
+        except Exception:
+            pass
+
+    for exe in _windows_browser_exe("BraveSoftware", "Brave-Browser", "Application", "brave.exe"):
+        try:
+            browser = await chromium.launch(headless=True, executable_path=exe, args=launch_args)
+            print("[+] Using installed Brave (no Chromium download).")
+            return browser
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "Firefox produced a blank Instagram shot, and no installed Chrome/Brave/Edge "
+        "could be launched. Install Google Chrome or run the capture again in Firefox."
+    )
+
 def screenshot_looks_blank(path: str) -> bool:
     """Treat missing/tiny PNGs as failed Instagram captures.
 
@@ -382,6 +417,152 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
 # ============================================================================
 # 6. SOCIAL MEDIA SCREENSHOTTER (MOBILE VIEWPORT)
 # ============================================================================
+async def new_mobile_context(browser, user_agent: str, ig_cookies=None):
+    context = await browser.new_context(
+        viewport=S24_VIEWPORT,
+        is_mobile=True,
+        has_touch=True,
+        user_agent=user_agent,
+        locale="en-US",
+        color_scheme="light",
+        java_script_enabled=True,
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+    )
+    if ig_cookies is not None:
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        if ig_cookies:
+            try:
+                await context.add_cookies(ig_cookies)
+            except Exception as cookie_err:
+                print(f"    [!] Some cookies could not be applied: {cookie_err}")
+    return context
+
+async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str) -> list:
+    """Load IG, screenshot slides, return saved file paths."""
+    saved_paths = []
+    print("[+] Waiting for Instagram media to paint...")
+
+    embed_url = instagram_embed_url(url)
+    media_ready = False
+
+    if embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
+        print(f"[+] Trying Instagram embed card: {embed_url}")
+        try:
+            await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
+            await prepare_instagram_media(page)
+            media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
+        except Exception as embed_err:
+            print(f"    [!] Embed navigation failed: {embed_err}")
+
+    if not media_ready:
+        print("[+] Embed empty or blocked — loading the original post URL...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+        await dismiss_instagram_walls(page)
+        await prepare_instagram_media(page)
+        media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
+
+    if not media_ready:
+        print("    [!] Media still not painted — extra settle wait...")
+        await page.wait_for_timeout(4000)
+        await prepare_instagram_media(page)
+        media_ready = await wait_for_instagram_media(page, timeout_ms=8000)
+
+    await dismiss_instagram_walls(page)
+    await page.wait_for_timeout(800)
+
+    ig_username = await page.evaluate(
+        """() => {
+        let iosUrl = document.querySelector('meta[property="al:ios:url"]');
+        if (iosUrl && iosUrl.content && iosUrl.content.includes('username=')) {
+            return iosUrl.content.split('username=')[1].split('&')[0];
+        }
+        let ogTitle = document.querySelector('meta[property="og:title"]');
+        if (ogTitle && ogTitle.content) {
+            let match = ogTitle.content.match(/@([a-zA-Z0-9_.]+)/);
+            if (match) return match[1];
+            let match2 = ogTitle.content.match(/^([a-zA-Z0-9_.]+)\\s+on Instagram/);
+            if (match2) return match2[1];
+        }
+        let headerLinks = document.querySelectorAll('header a');
+        for (let a of headerLinks) {
+            let text = a.innerText.trim();
+            if (text && !text.includes(' ') && !text.includes('\\n')) return text;
+        }
+        return 'unknown';
+    }"""
+    )
+    filename_base = f"instagram.com_@{ig_username}_{timestamp_str}"
+    print(f"[+] Username identified: @{ig_username}")
+
+    print("[+] Injecting perfectly aligned 8pt Bold Timestamp...")
+    await inject_instagram_timestamp(page, timestamp_str)
+
+    element = await pick_instagram_element(page)
+
+    slide_num = 1
+    while True:
+        current_filename = (
+            f"{filename_base}.png"
+            if slide_num == 1
+            else f"{filename_base}_slide{slide_num}.png"
+        )
+        output_path = os.path.join(output_dir, current_filename)
+
+        print(f"[+] Taking tight crop screenshot... Saving as {current_filename}")
+        await prepare_instagram_media(page)
+        await page.wait_for_timeout(400)
+
+        try:
+            box = await element.bounding_box()
+            if not box or box["height"] < 80:
+                element = await pick_instagram_element(page)
+            await element.screenshot(path=output_path, animations="disabled")
+        except Exception:
+            await page.screenshot(path=output_path, full_page=True, animations="disabled")
+
+        if screenshot_looks_blank(output_path):
+            print("    [!] Capture looked blank — retrying as a full-page shot...")
+            await page.wait_for_timeout(1500)
+            await prepare_instagram_media(page)
+            try:
+                element = await pick_instagram_element(page)
+                await element.screenshot(path=output_path, animations="disabled")
+            except Exception:
+                pass
+            if screenshot_looks_blank(output_path):
+                await page.screenshot(
+                    path=output_path, full_page=True, animations="disabled"
+                )
+
+        saved_paths.append(output_path)
+
+        next_btn = page.locator('button[aria-label="Next"]')
+        if await next_btn.count() > 0 and await next_btn.is_visible():
+            print("    [>] Found multi-slide post. Clicking next...")
+            await next_btn.click()
+            await page.wait_for_timeout(1500)
+            await prepare_instagram_media(page)
+            await wait_for_instagram_media(page, timeout_ms=8000)
+
+            if slide_num == 1:
+                first_slide_new_name = os.path.join(
+                    output_dir, f"{filename_base}_slide1.png"
+                )
+                if os.path.exists(output_path):
+                    os.rename(output_path, first_slide_new_name)
+                    saved_paths[-1] = first_slide_new_name
+
+            slide_num += 1
+            if slide_num > 20:
+                break
+        else:
+            break
+
+    return saved_paths
+
 async def capture_post(url: str):
     from playwright.async_api import async_playwright
 
@@ -407,43 +588,16 @@ async def capture_post(url: str):
         target_url = url
         filename_base = ""
 
-    print("[+] Launching background browser in Mobile (S24 Ultra) Mode...")
+    print("[+] Launching Playwright Firefox in Mobile (S24 Ultra) Mode...")
     async with async_playwright() as p:
         browser = None
         try:
-            if is_twitter:
-                browser = await p.firefox.launch(headless=True)
-            else:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-
-            context = await browser.new_context(
-                viewport=S24_VIEWPORT,
-                is_mobile=True,
-                has_touch=True,
-                user_agent=S24_UA,
-                locale="en-US",
-                color_scheme="light",
-                java_script_enabled=True,
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-
-            if is_instagram:
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-                ig_cookies = get_instagram_cookies()
-                if ig_cookies:
-                    try:
-                        await context.add_cookies(ig_cookies)
-                    except Exception as cookie_err:
-                        print(f"    [!] Some cookies could not be applied: {cookie_err}")
-
+            browser = await p.firefox.launch(headless=True)
+            ig_cookies = get_instagram_cookies() if is_instagram else None
+            # Twitter already works with the Chrome-style UA on Firefox.
+            # Instagram gets a real Firefox UA so the page actually paints.
+            ua = S24_FIREFOX_UA if is_instagram else S24_UA
+            context = await new_mobile_context(browser, ua, ig_cookies)
             page = await context.new_page()
 
             print(f"[+] Loading Target URL: {target_url}")
@@ -489,125 +643,23 @@ async def capture_post(url: str):
                 print(f"\n✅ SUCCESS! Screenshot securely saved to: {output_dir}")
 
             # =================================================================
-            # INSTAGRAM LOGIC
+            # INSTAGRAM LOGIC — Firefox first
             # =================================================================
             else:
-                print("[+] Waiting for Instagram media to paint...")
+                saved_paths = await capture_instagram(page, url, output_dir, timestamp_str)
+                still_blank = saved_paths and all(screenshot_looks_blank(p) for p in saved_paths)
 
-                embed_url = instagram_embed_url(url)
-                media_ready = False
-
-                # Try the official embed card first (public posts; avoids blank SPA shells).
-                if embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
-                    print(f"[+] Trying Instagram embed card: {embed_url}")
-                    try:
-                        await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
-                        await prepare_instagram_media(page)
-                        media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
-                    except Exception as embed_err:
-                        print(f"    [!] Embed navigation failed: {embed_err}")
-
-                if not media_ready:
-                    print("[+] Embed empty or blocked — loading the original post URL...")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await page.wait_for_timeout(1500)
-                    await dismiss_instagram_walls(page)
-                    await prepare_instagram_media(page)
-                    media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
-
-                if not media_ready:
-                    print("    [!] Media still not painted — extra settle wait...")
-                    await page.wait_for_timeout(4000)
-                    await prepare_instagram_media(page)
-                    media_ready = await wait_for_instagram_media(page, timeout_ms=8000)
-
-                await dismiss_instagram_walls(page)
-                await page.wait_for_timeout(800)
-
-                ig_username = await page.evaluate(
-                    """() => {
-                    let iosUrl = document.querySelector('meta[property="al:ios:url"]');
-                    if (iosUrl && iosUrl.content && iosUrl.content.includes('username=')) {
-                        return iosUrl.content.split('username=')[1].split('&')[0];
-                    }
-                    let ogTitle = document.querySelector('meta[property="og:title"]');
-                    if (ogTitle && ogTitle.content) {
-                        let match = ogTitle.content.match(/@([a-zA-Z0-9_.]+)/);
-                        if (match) return match[1];
-                        let match2 = ogTitle.content.match(/^([a-zA-Z0-9_.]+)\\s+on Instagram/);
-                        if (match2) return match2[1];
-                    }
-                    let headerLinks = document.querySelectorAll('header a');
-                    for (let a of headerLinks) {
-                        let text = a.innerText.trim();
-                        if (text && !text.includes(' ') && !text.includes('\\n')) return text;
-                    }
-                    return 'unknown';
-                }"""
-                )
-                filename_base = f"instagram.com_@{ig_username}_{timestamp_str}"
-                print(f"[+] Username identified: @{ig_username}")
-
-                print("[+] Injecting perfectly aligned 8pt Bold Timestamp...")
-                await inject_instagram_timestamp(page, timestamp_str)
-
-                element = await pick_instagram_element(page)
-
-                slide_num = 1
-                while True:
-                    current_filename = (
-                        f"{filename_base}.png"
-                        if slide_num == 1
-                        else f"{filename_base}_slide{slide_num}.png"
+                if still_blank:
+                    print(
+                        "[!] Firefox still saved a blank Instagram frame. "
+                        "Falling back to your installed Chrome/Brave/Edge (not downloading Chromium)..."
                     )
-                    output_path = os.path.join(output_dir, current_filename)
-
-                    print(f"[+] Taking tight crop screenshot... Saving as {current_filename}")
-                    await prepare_instagram_media(page)
-                    await page.wait_for_timeout(400)
-
-                    try:
-                        box = await element.bounding_box()
-                        if not box or box["height"] < 80:
-                            element = await pick_instagram_element(page)
-                        await element.screenshot(path=output_path, animations="disabled")
-                    except Exception:
-                        await page.screenshot(path=output_path, full_page=True, animations="disabled")
-
-                    if screenshot_looks_blank(output_path):
-                        print("    [!] Capture looked blank — retrying as a full-page shot...")
-                        await page.wait_for_timeout(1500)
-                        await prepare_instagram_media(page)
-                        try:
-                            element = await pick_instagram_element(page)
-                            await element.screenshot(path=output_path, animations="disabled")
-                        except Exception:
-                            pass
-                        if screenshot_looks_blank(output_path):
-                            await page.screenshot(
-                                path=output_path, full_page=True, animations="disabled"
-                            )
-
-                    next_btn = page.locator('button[aria-label="Next"]')
-                    if await next_btn.count() > 0 and await next_btn.is_visible():
-                        print("    [>] Found multi-slide post. Clicking next...")
-                        await next_btn.click()
-                        await page.wait_for_timeout(1500)
-                        await prepare_instagram_media(page)
-                        await wait_for_instagram_media(page, timeout_ms=8000)
-
-                        if slide_num == 1:
-                            first_slide_new_name = os.path.join(
-                                output_dir, f"{filename_base}_slide1.png"
-                            )
-                            if os.path.exists(output_path):
-                                os.rename(output_path, first_slide_new_name)
-
-                        slide_num += 1
-                        if slide_num > 20:
-                            break
-                    else:
-                        break
+                    await browser.close()
+                    browser = None
+                    browser = await launch_installed_chrome_family(p)
+                    context = await new_mobile_context(browser, S24_CHROME_UA, ig_cookies)
+                    page = await context.new_page()
+                    saved_paths = await capture_instagram(page, url, output_dir, timestamp_str)
 
                 print(f"\n✅ SUCCESS! Mobile Screenshot(s) securely saved to: {output_dir}")
 
