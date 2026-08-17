@@ -851,7 +851,7 @@ async def capture_post(url: str):
                 await page.wait_for_selector("article", state="visible", timeout=15000)
                 await page.wait_for_timeout(3000)
 
-                print("[+] Injecting 9pt Bold Timestamp...")
+                print("[+] Injecting 11pt Bold Timestamp...")
                 await page.evaluate(
                     """(ts) => {
                     let timeElems = document.querySelectorAll('time');
