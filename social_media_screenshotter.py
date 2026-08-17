@@ -211,7 +211,7 @@ async def dismiss_instagram_walls(page):
     try:
         await page.evaluate(
             """() => {
-                const skip = /not now|cancel|maybe later|log in later|skip/i;
+                const skip = /not now|cancel|maybe later|log in later|skip|continue on web/i;
                 const cookieOk = /allow all cookies|accept all|accept cookies|allow cookies/i;
                 document.querySelectorAll('button, div[role="button"]').forEach(b => {
                     const txt = (b.innerText || b.getAttribute('aria-label') || '').trim();
@@ -233,6 +233,20 @@ async def dismiss_instagram_walls(page):
         )
     except Exception:
         pass
+
+async def is_instagram_app_wall(page) -> bool:
+    """True when Instagram shows Open app / Continue on web instead of the post."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const t = ((document.body && document.body.innerText) || '').toLowerCase();
+                return t.includes('watch this reel in the app')
+                    || t.includes('watch this post in the app')
+                    || (t.includes('open instagram') && t.includes('continue on web'));
+            }"""
+        )
+    except Exception:
+        return False
 
 async def wait_for_instagram_actions(page, timeout_ms: int = 8000) -> bool:
     """Wait for the native Comment / Share / Repost icons (not the embed-only bar)."""
@@ -618,27 +632,44 @@ async def new_mobile_context(browser, user_agent: str, ig_cookies=None):
 async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str, timestamp_display: str) -> list:
     """Load IG, screenshot slides, return saved file paths."""
     saved_paths = []
-    print("[+] Loading Instagram post page for the full action bar...")
+    print("[+] Waiting for Instagram media to paint...")
     media_ready = False
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1500)
-        await dismiss_instagram_walls(page)
-        await prepare_instagram_media(page)
-        media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
-        await wait_for_instagram_actions(page)
-    except Exception as post_err:
-        print(f"    [!] Post page failed: {post_err}")
-
     embed_url = instagram_embed_url(url)
-    if not media_ready and embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
-        print("[+] Post page empty — trying Instagram embed card as fallback...")
+
+    if embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
+        print(f"[+] Trying Instagram embed card: {embed_url}")
         try:
             await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
             await prepare_instagram_media(page)
             media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
+            if await is_instagram_app_wall(page):
+                media_ready = False
         except Exception as embed_err:
             print(f"    [!] Embed navigation failed: {embed_err}")
+
+    if not media_ready:
+        print("[+] Embed empty or blocked — loading the original post URL...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+        await dismiss_instagram_walls(page)
+        try:
+            cont = page.get_by_text("Continue on web", exact=False)
+            if await cont.count() > 0:
+                await cont.first.click(timeout=3000)
+                await page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        await prepare_instagram_media(page)
+        media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
+        if await is_instagram_app_wall(page):
+            print("[+] Hit Instagram app wall — returning to embed card...")
+            media_ready = False
+            try:
+                await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
+                await prepare_instagram_media(page)
+                media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
+            except Exception:
+                pass
 
     if not media_ready:
         print("    [!] Media still not painted — extra settle wait...")
