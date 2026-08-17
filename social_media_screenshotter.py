@@ -830,7 +830,7 @@ async def capture_post(url: str):
                         stamp.innerText = "Post_Saved_On : " + ts;
                         stamp.style.fontFamily = "Arial, Helvetica, sans-serif";
                         stamp.style.fontWeight = "bold";
-                        stamp.style.fontSize = "9pt";
+                        stamp.style.fontSize = "11pt";
                         stamp.style.whiteSpace = "nowrap";
                         stamp.style.marginLeft = "auto";
                         stamp.style.paddingLeft = "20px";
