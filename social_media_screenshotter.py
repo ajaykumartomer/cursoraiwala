@@ -234,6 +234,22 @@ async def dismiss_instagram_walls(page):
     except Exception:
         pass
 
+async def wait_for_instagram_actions(page, timeout_ms: int = 8000) -> bool:
+    """Wait for the native Comment / Share / Repost icons (not the embed-only bar)."""
+    try:
+        await page.wait_for_function(
+            """() => {
+                const hit = (n) => document.querySelector(
+                    'svg[aria-label="' + n + '"], svg[aria-label*="' + n + '" i]'
+                );
+                return !!(hit('Comment') || hit('Share') || hit('Send') || hit('Repost'));
+            }""",
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        return False
+
 async def wait_for_instagram_media(page, timeout_ms: int = 25000) -> bool:
     """Wait until a real photo/video frame has painted (not an empty shell)."""
     try:
@@ -469,19 +485,39 @@ async def hide_instagram_below_actions(page):
                     '.Caption, .CaptionText, .Comments, .EmbedComments, .embedComment'
                 ).forEach(hide);
 
-                const heartSvg = document.querySelector(
-                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
-                );
-                if (heartSvg) {
-                    const btn = heartSvg.closest('div[role="button"], button, a') || heartSvg.parentElement;
-                    const actionRow = btn && btn.parentElement;
-                    const targetFeedback = actionRow && actionRow.parentElement;
-                    if (targetFeedback) {
-                        let sibling = targetFeedback.nextElementSibling;
-                        while (sibling) {
-                            hide(sibling);
-                            sibling = sibling.nextElementSibling;
-                        }
+                const names = ['Like','Unlike','Comment','Repost','Share','Share Post','Share to','Send','Save','Remove'];
+                const icons = [];
+                names.forEach(n => {
+                    document.querySelectorAll(
+                        'svg[aria-label="' + n + '"], svg[aria-label*="' + n + '" i]'
+                    ).forEach(s => icons.push(s));
+                });
+                if (!icons.length) return;
+
+                const lca = (a, b) => {
+                    if (!a) return b;
+                    if (!b) return a;
+                    const seen = [];
+                    for (let n = a; n; n = n.parentElement) seen.push(n);
+                    for (let n = b; n; n = n.parentElement) {
+                        if (seen.includes(n)) return n;
+                    }
+                    return a;
+                };
+                let row = icons[0];
+                icons.slice(1).forEach(ic => { row = lca(row, ic); });
+                while (row && row.parentElement) {
+                    const p = row.parentElement;
+                    const ph = p.getBoundingClientRect().height;
+                    const txt = (p.innerText || '').split('\\n').slice(0, 4).join(' ');
+                    if (ph < 150 && /[\\d,.]+\\s+likes/i.test(txt)) { row = p; break; }
+                    break;
+                }
+                if (row) {
+                    let sibling = row.nextElementSibling;
+                    while (sibling) {
+                        hide(sibling);
+                        sibling = sibling.nextElementSibling;
                     }
                 }
 
@@ -503,16 +539,20 @@ async def instagram_crop_clip(element):
         clip = await element.evaluate(
             """(el) => {
                 const rootRect = el.getBoundingClientRect();
-                const heartSvg = el.querySelector(
-                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
-                ) || document.querySelector(
-                    'svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Like "], svg[aria-label*="Like" i], [aria-label="Like"], .coreSpriteHeartOpen'
-                );
-                if (!heartSvg) return null;
-
-                const btn = heartSvg.closest('div[role="button"], button, a') || heartSvg.parentElement;
-                const actionRow = btn && btn.parentElement;
-                let cut = (actionRow || heartSvg).getBoundingClientRect().bottom;
+                const names = ['Like','Unlike','Comment','Repost','Share','Share Post','Share to','Send','Save','Remove'];
+                let cut = 0;
+                names.forEach(n => {
+                    const nodes = el.querySelectorAll(
+                        'svg[aria-label="' + n + '"], svg[aria-label*="' + n + '" i]'
+                    );
+                    const fallback = document.querySelectorAll(
+                        'svg[aria-label="' + n + '"], svg[aria-label*="' + n + '" i]'
+                    );
+                    (nodes.length ? nodes : fallback).forEach(s => {
+                        cut = Math.max(cut, s.getBoundingClientRect().bottom);
+                    });
+                });
+                if (!cut) return null;
 
                 const likeRe = /^[\\d,.\\s]+likes$/i;
                 el.querySelectorAll('span, a, div').forEach(node => {
@@ -578,27 +618,27 @@ async def new_mobile_context(browser, user_agent: str, ig_cookies=None):
 async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str, timestamp_display: str) -> list:
     """Load IG, screenshot slides, return saved file paths."""
     saved_paths = []
-    print("[+] Waiting for Instagram media to paint...")
+    print("[+] Loading Instagram post page for the full action bar...")
+    media_ready = False
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+        await dismiss_instagram_walls(page)
+        await prepare_instagram_media(page)
+        media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
+        await wait_for_instagram_actions(page)
+    except Exception as post_err:
+        print(f"    [!] Post page failed: {post_err}")
 
     embed_url = instagram_embed_url(url)
-    media_ready = False
-
-    if embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
-        print(f"[+] Trying Instagram embed card: {embed_url}")
+    if not media_ready and embed_url.rstrip("/") != url.split("?")[0].rstrip("/"):
+        print("[+] Post page empty — trying Instagram embed card as fallback...")
         try:
             await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
             await prepare_instagram_media(page)
             media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
         except Exception as embed_err:
             print(f"    [!] Embed navigation failed: {embed_err}")
-
-    if not media_ready:
-        print("[+] Embed empty or blocked — loading the original post URL...")
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1500)
-        await dismiss_instagram_walls(page)
-        await prepare_instagram_media(page)
-        media_ready = await wait_for_instagram_media(page, timeout_ms=20000)
 
     if not media_ready:
         print("    [!] Media still not painted — extra settle wait...")
