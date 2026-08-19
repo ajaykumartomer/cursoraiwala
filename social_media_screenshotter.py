@@ -611,9 +611,9 @@ async def inject_instagram_timestamp(page, timestamp_str: str):
                     // EXACTLY TWO-SPACE VISUAL GAP after "View more on Instagram".
                     // Keep this gap fixed; the timestamp itself is allowed to
                     // become smaller so the ENTIRE timestamp always fits.
-                    const TIMESTAMP_GAP_PX = 17;
+                    const TIMESTAMP_GAP_PX = 20;
 
-                    stamp.style.marginLeft = `calc(${TIMESTAMP_GAP_PX}px)`;
+                    stamp.style.marginLeft = `calc(${TIMESTAMP_GAP_PX}px - 2ch)`;
                     stamp.style.marginRight = "0";
                     stamp.style.paddingLeft = "0";
                     stamp.style.paddingRight = "0";
@@ -1118,7 +1118,7 @@ async def capture_post(url: str):
                         stamp.style.fontSize = "12px";
                         stamp.style.whiteSpace = "nowrap";
                         stamp.style.textAlign = "left";
-                        stamp.style.marginLeft = "calc(3ch + 8px)";
+                        stamp.style.marginLeft = "5ch";
                         stamp.style.marginRight = "0";
                         stamp.style.paddingLeft = "0";
                         stamp.style.color = "#000";
