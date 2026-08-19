@@ -46,6 +46,8 @@ IG_SHORTCODE_RE = re.compile(
 # ============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 URL_PICKER_FILE = Path(SCRIPT_DIR) / "Social Media SnapShottter URL Picker.txt"
+DONE_URL_LOG_FILE = Path(SCRIPT_DIR) / "Done Social Media SnapShottter URL.txt"
+ERROR_LOG_FILE = Path(SCRIPT_DIR) / "Error Social Media SnapShottter URL.txt"
 
 
 def ensure_url_picker_file() -> Path:
@@ -112,6 +114,69 @@ def remove_url_from_picker(url: str) -> bool:
     except Exception as e:
         print(f"[!] Could not remove URL from picker: {e}")
     return False
+
+
+def record_completed_url(url: str) -> None:
+    """Record a successfully completed URL at the top with newest entry as #1."""
+    if not url:
+        return
+
+    try:
+        existing_urls = []
+        if DONE_URL_LOG_FILE.exists():
+            text = DONE_URL_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                m = re.search(r"https?://[^\s<>\"'\])\}]+", line, re.IGNORECASE)
+                if m:
+                    saved_url = m.group(0).rstrip(".,;:)")
+                    if saved_url and saved_url.lower() not in {u.lower() for u in existing_urls}:
+                        existing_urls.append(saved_url)
+
+        ordered_urls = [url.strip()]
+        ordered_urls.extend(
+            u for u in existing_urls if u.strip().lower() != url.strip().lower()
+        )
+
+        # Keep newest URL at the TOP, but assign serial numbers in chronological
+        # order: the oldest completed URL is always #1, and the newest is the
+        # highest serial number.
+        total = len(ordered_urls)
+        DONE_URL_LOG_FILE.write_text(
+            "\n".join(
+                f"{total - i}. {u}" for i, u in enumerate(ordered_urls)
+            ) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[+] Completed URL recorded: {DONE_URL_LOG_FILE.name}")
+    except Exception as e:
+        print(f"[!] Could not update completed URL log: {e}")
+
+
+def record_error(url: str, error: object, context: str = "") -> None:
+    """Append a failed URL/error to the error log. This file is created only on failure."""
+    try:
+        from traceback import format_exc
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        error_text = str(error)
+        trace = format_exc()
+        if trace.strip() == "NoneType: None":
+            trace = ""
+
+        with ERROR_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"Time: {timestamp}\n")
+            f.write(f"URL: {url or '[unknown]'}\n")
+            if context:
+                f.write(f"Context: {context}\n")
+            f.write(f"Error: {error_text}\n")
+            if trace.strip():
+                f.write("Traceback:\n")
+                f.write(trace.rstrip() + "\n")
+            f.write("\n")
+        print(f"[+] Error recorded: {ERROR_LOG_FILE.name}")
+    except Exception as log_error:
+        print(f"[!] Could not write error log: {log_error}")
 
 
 def get_url_with_timeout():
@@ -384,6 +449,32 @@ async def dismiss_instagram_walls(page):
         )
     except Exception:
         pass
+
+async def is_instagram_age_restriction(page) -> bool:
+    """True when Instagram shows the account age/content visibility restriction."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const t = ((document.body && document.body.innerText) || '').toLowerCase();
+                return t.includes("people under 25 can't see this content")
+                    || t.includes("people under 25 can\'t see this content")
+                    || (t.includes("this account has set limits on who can see their profile and content")
+                        && t.includes("people under 25"));
+            }"""
+        )
+    except Exception:
+        return False
+
+
+async def raise_if_instagram_age_restricted(page, url: str = "") -> None:
+    """Stop an Instagram job when the requested post is blocked by an age/content restriction."""
+    if await is_instagram_age_restriction(page):
+        raise RuntimeError(
+            "Instagram content visibility restriction detected: "
+            "People under 25 can't see this content. "
+            "This account has set limits on who can see their profile and content."
+        )
+
 
 async def is_instagram_app_wall(page) -> bool:
     """True when Instagram shows Open app / Continue on web instead of the post."""
@@ -858,6 +949,79 @@ async def new_mobile_context(browser, user_agent: str, ig_cookies=None):
                 print(f"    [!] Some cookies could not be applied: {cookie_err}")
     return context
 
+
+async def get_visible_video_regions(page):
+    """Return visible video bounding boxes in viewport coordinates."""
+    try:
+        return await page.evaluate("""() => {
+            const out = [];
+            for (const v of document.querySelectorAll('video')) {
+                const r = v.getBoundingClientRect();
+                const cs = getComputedStyle(v);
+                if (r.width > 20 && r.height > 20 &&
+                    r.bottom > 0 && r.right > 0 &&
+                    r.top < window.innerHeight && r.left < window.innerWidth &&
+                    cs.display !== 'none' && cs.visibility !== 'hidden' &&
+                    cs.opacity !== '0') {
+                    out.push({
+                        x: Math.max(0, r.left),
+                        y: Math.max(0, r.top),
+                        width: Math.min(r.width, window.innerWidth - Math.max(0, r.left)),
+                        height: Math.min(r.height, window.innerHeight - Math.max(0, r.top))
+                    });
+                }
+            }
+            return out;
+        }""")
+    except Exception:
+        return []
+
+
+async def screenshot_with_video_green(page, output_path, screenshot_kind='page', element=None, clip=None):
+    """Save an extra copy with every visible video rectangle replaced by pure green."""
+    regions = await get_visible_video_regions(page)
+    if not regions:
+        return False
+
+    try:
+        await page.evaluate("""(regions) => {
+            document.querySelectorAll('[data-akt-green-video-overlay]').forEach(e => e.remove());
+            for (const r of regions) {
+                const d = document.createElement('div');
+                d.setAttribute('data-akt-green-video-overlay', '1');
+                d.style.position = 'fixed';
+                d.style.left = r.x + 'px';
+                d.style.top = r.y + 'px';
+                d.style.width = r.width + 'px';
+                d.style.height = r.height + 'px';
+                d.style.background = '#00FF00';
+                d.style.zIndex = '2147483647';
+                d.style.pointerEvents = 'none';
+                d.style.margin = '0';
+                d.style.padding = '0';
+                document.documentElement.appendChild(d);
+            }
+        }""", regions)
+        await page.wait_for_timeout(100)
+
+        if screenshot_kind == 'element' and element is not None:
+            await element.screenshot(path=output_path, animations='disabled')
+        elif clip is not None:
+            await page.screenshot(path=output_path, clip=clip, animations='disabled')
+        else:
+            await page.screenshot(path=output_path, full_page=True, animations='disabled')
+        return True
+    except Exception as e:
+        print(f"    [!] Green-screen video screenshot failed: {e}")
+        return False
+    finally:
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('[data-akt-green-video-overlay]').forEach(e => e.remove());
+            }""")
+        except Exception:
+            pass
+
 async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str, timestamp_display: str) -> list:
     """Load IG, screenshot slides, return saved file paths."""
     saved_paths = []
@@ -869,6 +1033,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
         print(f"[+] Trying Instagram embed card: {embed_url}")
         try:
             await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
+            await raise_if_instagram_age_restricted(page, url)
             await prepare_instagram_media(page)
             media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
             if await is_instagram_app_wall(page):
@@ -880,6 +1045,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
         print("[+] Embed empty or blocked — loading the original post URL...")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(1500)
+        await raise_if_instagram_age_restricted(page, url)
         await dismiss_instagram_walls(page)
         try:
             cont = page.get_by_text("Continue on web", exact=False)
@@ -895,6 +1061,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
             media_ready = False
             try:
                 await page.goto(embed_url, wait_until="domcontentloaded", timeout=45000)
+                await raise_if_instagram_age_restricted(page, url)
                 await prepare_instagram_media(page)
                 media_ready = await wait_for_instagram_media(page, timeout_ms=18000)
             except Exception:
@@ -908,6 +1075,7 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
 
     await dismiss_instagram_walls(page)
     await page.wait_for_timeout(800)
+    await raise_if_instagram_age_restricted(page, url)
 
     ig_username = await page.evaluate(
         """() => {
@@ -1029,6 +1197,31 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
 
         saved_paths.append(output_path)
 
+        # Extra green-screen copy ONLY when this slide contains a real video.
+        green_output_path = os.path.splitext(output_path)[0] + "_GREEN_VIDEO.png"
+        green_clip = None
+        try:
+            crop_for_green = await hide_instagram_below_actions(page)
+            if crop_for_green and crop_for_green.get("bottom", 0) > 0:
+                viewport = page.viewport_size
+                green_clip = {
+                    "x": 0,
+                    "y": 0,
+                    "width": viewport["width"] if viewport else 412,
+                    "height": min(crop_for_green["bottom"], viewport["height"] if viewport else 915),
+                }
+            if await screenshot_with_video_green(page, green_output_path, clip=green_clip):
+                print(f"    [+] Green-screen video screenshot saved: {os.path.basename(green_output_path)}")
+            elif os.path.exists(green_output_path):
+                os.remove(green_output_path)
+        except Exception as green_err:
+            print(f"    [!] Could not create green-screen video screenshot: {green_err}")
+            if os.path.exists(green_output_path):
+                try:
+                    os.remove(green_output_path)
+                except Exception:
+                    pass
+
         next_btn = page.locator('button[aria-label="Next"]')
         if await next_btn.count() > 0 and await next_btn.is_visible():
             print("    [>] Found multi-slide post. Clicking next...")
@@ -1046,6 +1239,15 @@ async def capture_instagram(page, url: str, output_dir: str, timestamp_str: str,
                     os.rename(output_path, first_slide_new_name)
                     saved_paths[-1] = first_slide_new_name
 
+                first_green_name = os.path.join(
+                    output_dir, f"{filename_base}_slide1_GREEN_VIDEO.png"
+                )
+                current_green_name = os.path.join(
+                    output_dir, f"{filename_base}_GREEN_VIDEO.png"
+                )
+                if os.path.exists(current_green_name):
+                    os.rename(current_green_name, first_green_name)
+
             slide_num += 1
             if slide_num > 20:
                 break
@@ -1061,7 +1263,9 @@ async def capture_post(url: str):
     is_instagram = "instagram.com" in url or "instagr.am" in url
 
     if not is_twitter and not is_instagram:
-        print("\n❌ ERROR: Please enter a valid X/Twitter or Instagram URL.")
+        error = "Please enter a valid X/Twitter or Instagram URL."
+        print(f"\n❌ ERROR: {error}")
+        record_error(url, error, "URL validation")
         return False
 
     now = datetime.now()
@@ -1118,7 +1322,7 @@ async def capture_post(url: str):
                         stamp.style.fontSize = "12px";
                         stamp.style.whiteSpace = "nowrap";
                         stamp.style.textAlign = "left";
-                        stamp.style.marginLeft = "5ch";
+                        stamp.style.marginLeft = "10ch";
                         stamp.style.marginRight = "0";
                         stamp.style.paddingLeft = "0";
                         stamp.style.color = "#000";
@@ -1137,6 +1341,29 @@ async def capture_post(url: str):
                 element = page.locator("article").first
 
                 await element.screenshot(path=output_path)
+
+                # Extra green-screen copy ONLY if the tweet contains video.
+                green_output_path = os.path.join(
+                    output_dir, f"{filename_base}_GREEN_VIDEO.png"
+                )
+                try:
+                    if await screenshot_with_video_green(
+                        page, green_output_path, screenshot_kind="element", element=element
+                    ):
+                        print(
+                            f"    [+] Green-screen video screenshot saved: "
+                            f"{os.path.basename(green_output_path)}"
+                        )
+                    elif os.path.exists(green_output_path):
+                        os.remove(green_output_path)
+                except Exception as green_err:
+                    print(f"    [!] Could not create green-screen video screenshot: {green_err}")
+                    if os.path.exists(green_output_path):
+                        try:
+                            os.remove(green_output_path)
+                        except Exception:
+                            pass
+
                 print(f"\n✅ SUCCESS! Screenshot securely saved to: {output_dir}")
                 return True
 
@@ -1165,6 +1392,7 @@ async def capture_post(url: str):
         except Exception as e:
             print("\n❌ AN ERROR OCCURRED DURING CAPTURE:")
             print(str(e))
+            record_error(url, e, "Capture execution")
             return False
 
         finally:
@@ -1190,22 +1418,32 @@ if __name__ == "__main__":
                 try:
                     success = asyncio.run(capture_post(picker_url))
                     if success:
+                        record_completed_url(picker_url)
                         remove_url_from_picker(picker_url)
                     else:
                         print(
                             "[!] Job did not complete successfully — "
                             "URL kept in picker for retry."
                         )
+                        # capture_post records the detailed error when it fails.
                 except Exception as e:
                     print(f"[!] Picker URL job failed: {e}")
                     print("[!] URL kept in picker for retry.")
+                    record_error(picker_url, e, "Picker URL job")
         else:
             # Manual URL is requested ONLY when the picker has no URL.
             user_url = get_url_with_timeout()
             if user_url:
-                asyncio.run(capture_post(user_url))
+                try:
+                    success = asyncio.run(capture_post(user_url))
+                    if success:
+                        record_completed_url(user_url)
+                except Exception as e:
+                    print(f"[!] Manual URL job failed: {e}")
+                    record_error(user_url, e, "Manual URL job")
 
     except Exception as e:
         print(f"\nCRITICAL SCRIPT CRASH: {e}")
+        record_error("", e, "Critical script crash")
     finally:
         input("\nPress Enter to exit...")
