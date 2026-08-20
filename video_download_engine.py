@@ -422,27 +422,40 @@ def _rename_downloaded_video(
         ffmpeg = get_ffmpeg_executable()
         if ffmpeg:
             temp_mp4 = target + ".tmp.mp4"
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", temp_mp4],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=True,
-                    timeout=600,
-                )
-                os.replace(temp_mp4, target)
-                if os.path.abspath(path) != os.path.abspath(target):
+            remuxed = False
+            for args in (
+                ["-c", "copy", "-movflags", "+faststart"],
+                [
+                    "-c:v", "libx264", "-preset", "veryfast",
+                    "-c:a", "aac", "-movflags", "+faststart",
+                ],
+            ):
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-i", path, *args, temp_mp4],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                        timeout=600,
+                    )
+                    if _valid_video_file(temp_mp4):
+                        os.replace(temp_mp4, target)
+                        if os.path.abspath(path) != os.path.abspath(target):
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+                        remuxed = True
+                        break
+                except Exception:
                     try:
-                        os.remove(path)
+                        if os.path.exists(temp_mp4):
+                            os.remove(temp_mp4)
                     except Exception:
                         pass
+            if remuxed:
                 return target
-            except Exception:
-                try:
-                    if os.path.exists(temp_mp4):
-                        os.remove(temp_mp4)
-                except Exception:
-                    pass
+            # Fall through: rename original container if remux is impossible.
 
     if os.path.abspath(path) != os.path.abspath(target):
         try:
@@ -711,19 +724,39 @@ def _download_direct_media_url(
                     out.write(chunk)
 
             if _valid_video_file(target):
+                # Normalize non-MP4 containers to .mp4 when possible. If remux
+                # fails, keep the downloaded file under an .mp4 name anyway —
+                # never discard a valid download solely because remux failed.
                 if not lower.endswith(".mp4") and ffmpeg:
                     normalized = target + ".normalized.mp4"
-                    subprocess.run(
+                    remuxed = False
+                    for args in (
+                        ["-c", "copy", "-movflags", "+faststart"],
                         [
-                            ffmpeg, "-y", "-i", target, "-c", "copy",
-                            "-movflags", "+faststart", normalized,
+                            "-c:v", "libx264", "-preset", "veryfast",
+                            "-c:a", "aac", "-movflags", "+faststart",
                         ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=600,
-                        check=True,
-                    )
-                    os.replace(normalized, target)
+                    ):
+                        try:
+                            subprocess.run(
+                                [ffmpeg, "-y", "-i", target, *args, normalized],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=600,
+                                check=True,
+                            )
+                            if _valid_video_file(normalized):
+                                os.replace(normalized, target)
+                                remuxed = True
+                                break
+                        except Exception:
+                            try:
+                                if os.path.exists(normalized):
+                                    os.remove(normalized)
+                            except Exception:
+                                pass
+                    if not remuxed:
+                        print("[i] Kept downloaded media without remux (ffmpeg remux failed).")
                 return [target]
     except Exception as e:
         print(f"[i] Direct media fallback failed: {type(e).__name__}: {e}")
