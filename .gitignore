@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.akt_media_tools/
+.akt_tools/
+Social Media Screenshots/
+Social Media Videos/
+Social Media SnapShottter URL Picker.txt
+Completed Social Media SnapShottter URL.txt
+Done Social Media SnapShottter URL.txt
+Error Social Media SnapShottter URL.txt
+*.mp4
+*.mkv
+*.webm
+*.mov

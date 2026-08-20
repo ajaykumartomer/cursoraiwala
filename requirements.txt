@@ -1,0 +1,8 @@
+# AKT Social Media Snapshotter + Video Downloader
+playwright
+browser-cookie3
+yt-dlp
+yt-dlp-ejs
+imageio-ffmpeg
+gallery-dl
+streamlink
