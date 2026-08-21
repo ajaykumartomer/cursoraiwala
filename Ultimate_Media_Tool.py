@@ -133,7 +133,6 @@ COMBINED_AUDIO_DIR = Path(SCRIPT_DIR) / "Combined Audio Scraper by AKT"
 COMBINE_IMAGE_LOG = Path(SCRIPT_DIR) / "Combine Image Scraper.txt"
 COMBINE_VIDEO_LOG = Path(SCRIPT_DIR) / "Combine Video Scraper.txt"
 COMBINE_AUDIO_LOG = Path(SCRIPT_DIR) / "Combine Audio Scraper.txt"
-DRIVE_DONE_ARCHIVE = Path(SCRIPT_DIR) / "Completed Google Drive URLs.txt"
 GOOGLE_DRIVE_FOLDER_ID = "140ORcDFjaGalCC9qcnAiuO4oOF2SxUln"
 GOOGLE_CREDENTIALS_FILE = Path(SCRIPT_DIR) / "credentials.json"
 GOOGLE_TOKEN_FILE = Path(SCRIPT_DIR) / "token.json"
@@ -3574,8 +3573,9 @@ def _scraper_targets(
     (audio treated as Video).
     """
     if drive_doc_mode:
+        # Per-Doc tree sits beside the script (e.g. Chuslam/), NOT under Combined.
         title = safe_filename(drive_doc_title or "GoogleDoc", 100)
-        doc_root = ensure_dir(COMBINED_URL_ROOT / title)
+        doc_root = ensure_dir(Path(SCRIPT_DIR) / title)
         image_dir = ensure_dir(doc_root / f"{title} Image Scraper")
         video_dir = ensure_dir(doc_root / f"{title} Video Scraper")
         image_log = doc_root / f"{title} Image Scraper.txt"
@@ -3583,7 +3583,7 @@ def _scraper_targets(
         return {
             "image": (image_dir, image_log, "Image"),
             "video": (video_dir, video_log, "Video"),
-            "audio": (video_dir, video_log, "Audio"),
+            "audio": (video_dir, video_log, "Audio"),  # audio deliberately with Video
         }
 
     prefix = (output_prefix or "").strip()
@@ -3900,7 +3900,7 @@ def setup_tools() -> None:
     ensure_dir(GOOGLE_LIBS)
     ensure_dir(COMBINED_URL_ROOT)
     ensure_url_picker_file()
-    for path in (PICKER_DONE_FILE, PICKER_FAILED_FILE, JOB_LOG_FILE, DRIVE_DONE_ARCHIVE):
+    for path in (PICKER_DONE_FILE, PICKER_FAILED_FILE, JOB_LOG_FILE):
         if not path.exists():
             path.write_text("", encoding="utf-8")
 
@@ -4099,20 +4099,53 @@ def _extract_urls_from_google_doc(doc_id: str) -> List[str]:
     return urls
 
 
+def _drive_root_folder(doc_title: str) -> Path:
+    """Google Doc output root next to the script: {DocTitle}/"""
+    return ensure_dir(Path(SCRIPT_DIR) / safe_filename(doc_title or "GoogleDoc", 100))
+
+
+def _drive_done_file(doc_title: str) -> Path:
+    title = safe_filename(doc_title or "GoogleDoc", 100)
+    return _drive_root_folder(doc_title) / f"Completed {title} URL.txt"
+
+
 def _archive_drive_completed_url(url: str, doc_title: str = "") -> None:
-    append_text(
-        DRIVE_DONE_ARCHIVE,
-        f"{now_stamp()} [{doc_title}] {url}",
+    """Newest completed URL at top; oldest #1, newest largest serial."""
+    path = _drive_done_file(doc_title)
+    existing: List[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.search(r"https?://[^\s<>\"'\])\}]+", line, re.I)
+            if m:
+                u = m.group(0).rstrip(".,;:)")
+                if u.lower() not in {x.lower() for x in existing}:
+                    existing.append(u)
+    if url.lower() not in {x.lower() for x in existing}:
+        existing.append(url)
+    total = len(existing)
+    path.write_text(
+        "\n".join(f"{total - i}. {u}" for i, u in enumerate(reversed(existing))) + "\n",
+        encoding="utf-8",
     )
+    print_step("+", f"Recorded in {path.name}", C.GREEN)
 
 
-def _drive_url_already_done(url: str) -> bool:
-    if not DRIVE_DONE_ARCHIVE.exists():
-        return False
+def _drive_url_already_done(url: str, doc_title: str = "") -> bool:
+    """Check per-Doc completed archive (and legacy global file if present)."""
     needle = url.strip().lower()
-    for line in DRIVE_DONE_ARCHIVE.read_text(encoding="utf-8", errors="replace").splitlines():
-        if needle and needle in line.lower():
-            return True
+    if not needle:
+        return False
+    candidates = []
+    if doc_title:
+        candidates.append(_drive_done_file(doc_title))
+    legacy = Path(SCRIPT_DIR) / "Completed Google Drive URLs.txt"
+    candidates.append(legacy)
+    for path in candidates:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if needle in line.lower():
+                return True
     return False
 
 
@@ -4166,28 +4199,30 @@ def _remove_url_from_google_doc(doc_id: str, url: str) -> bool:
 
 def _process_one_drive_url(url: str, doc_id: str, doc_title: str) -> bool:
     """Download original media + screenshots separately; scrape originals only."""
-    safe_title = safe_filename(doc_title or "GoogleDoc", 100)
-    doc_root = ensure_dir(COMBINED_URL_ROOT / safe_title)
+    doc_root = _drive_root_folder(doc_title)
     screenshots_dir = ensure_dir(doc_root / "Screenshots")
     download_dir = ensure_dir(doc_root / "_downloads")
 
     print_step("~", f"Drive URL: {url}", C.BLUE)
     media, log, permanent = download_media_from_url(url, download_dir)
-    shots = run_screenshot_stage(url, screenshots_dir)
-    if shots:
-        print_step("+", f"{len(shots)} screenshot(s) saved under Screenshots/ (excluded from OCR)", C.DIM)
+
+    # Screenshot stream is deliberately SEPARATE — never fed to OCR/Whisper.
+    try:
+        shots = run_screenshot_stage(url, screenshots_dir)
+        if shots:
+            print_step(
+                "+",
+                f"{len(shots)} timestamp/green screenshot(s) — excluded from OCR/Whisper",
+                C.GREEN,
+            )
+    except Exception as shot_err:
+        print_step("~", f"Screenshot stage skipped: {shot_err}", C.YELLOW)
+        shots = []
 
     if not media:
-        platform = detect_platform(url)
-        # Screenshot-only social posts can still count as partial success if shots exist
-        if shots and platform in ("x", "instagram"):
-            ok = True
-        else:
-            print_step("!", f"No original media downloaded for {url}", C.YELLOW)
-            append_text(JOB_LOG_FILE, f"{now_stamp()} DRIVE_FAIL {doc_title} {url}\n{log}\n")
-            return False
-    else:
-        ok = True
+        print_step("!", "Download failed — URL remains in Google Doc for retry", C.YELLOW)
+        append_text(JOB_LOG_FILE, f"{now_stamp()} DRIVE_FAIL {doc_title} {url}\n{log}\n")
+        return False
 
     # OCR/Whisper ONLY on original downloaded media — never screenshots
     processed, errors = run_scraper(
@@ -4198,17 +4233,23 @@ def _process_one_drive_url(url: str, doc_id: str, doc_title: str) -> bool:
     )
     append_text(
         JOB_LOG_FILE,
-        f"{now_stamp()} DRIVE_OK {doc_title} url={url} media={len(media)} "
+        f"{now_stamp()} DRIVE job {doc_title} url={url} media={len(media)} "
         f"shots={len(shots)} scraped={processed} errors={errors}\n",
     )
-    if ok and errors == 0:
-        _remove_url_from_google_doc(doc_id, url)
-        _archive_drive_completed_url(url, doc_title)
-        return True
-    if ok and processed > 0:
-        _remove_url_from_google_doc(doc_id, url)
-        _archive_drive_completed_url(url, doc_title)
-        return True
+
+    # Remove from Doc only after successful scrape; archive only after Doc removal.
+    if processed > 0 and errors == 0:
+        if _remove_url_from_google_doc(doc_id, url):
+            _archive_drive_completed_url(url, doc_title)
+            return True
+        print_step(
+            "!",
+            "Media job succeeded, but Google Doc URL could not be removed; URL remains for retry.",
+            C.YELLOW,
+        )
+        return False
+
+    print_step("!", "Scrape incomplete — URL remains in Google Doc for retry", C.YELLOW)
     return False
 
 
@@ -4233,12 +4274,13 @@ def _process_google_drive_docs() -> bool:
     for doc in docs:
         doc_id, title = doc["id"], doc["name"]
         print_step("~", f"Doc: {title}", C.CYAN)
+        _drive_root_folder(title)  # ensure per-Doc tree exists
         try:
             urls = _extract_urls_from_google_doc(doc_id)
         except Exception as exc:
             print_step("!", f"Extract URLs failed for {title}: {exc}", C.YELLOW)
             continue
-        pending = [u for u in urls if not _drive_url_already_done(u)]
+        pending = [u for u in urls if not _drive_url_already_done(u, title)]
         print_step("~", f"{len(pending)} pending URL(s) (skipped {len(urls) - len(pending)} done)", C.DIM)
         for url in pending:
             try:
@@ -4305,26 +4347,39 @@ def get_url_with_timeout_umt(seconds: int = 8) -> str:
 
 def process_picker_url(url: str) -> bool:
     """Process one picker URL into COMBINED_URL_ROOT; screenshots separate from OCR."""
-    platform = detect_platform(url)
-    stamp = datetime.now().strftime("%d_%b_%Y_%H%M")
-    job_root = ensure_dir(
-        COMBINED_URL_ROOT / safe_filename(f"{platform}_{stamp}_{abs(hash(url)) % 100000}", 80)
-    )
-    download_dir = ensure_dir(job_root / "_downloads")
-    screenshots_dir = ensure_dir(job_root / "Screenshots")
+    ensure_dir(COMBINED_URL_ROOT)
+    download_dir = COMBINED_URL_ROOT
+    screenshots_dir = ensure_dir(COMBINED_URL_ROOT / "Screenshots")
 
     media, log, permanent = download_media_from_url(url, download_dir)
-    shots = run_screenshot_stage(url, screenshots_dir)
-    if shots:
-        print_step("+", f"{len(shots)} screenshot(s) (logging only — excluded from OCR/Whisper)", C.DIM)
 
-    success = bool(media) or (bool(shots) and platform in ("x", "instagram"))
-    if media:
-        run_scraper(
-            only_files=media,
-            output_prefix=job_root.name,
-            job_name=f"Picker:{url}",
-        )
+    try:
+        shots = run_screenshot_stage(url, screenshots_dir)
+        if shots:
+            print_step(
+                "+",
+                f"{len(shots)} timestamp/green screenshot(s) — excluded from OCR/Whisper",
+                C.GREEN,
+            )
+    except Exception as shot_err:
+        print_step("~", f"Screenshot stage skipped: {shot_err}", C.YELLOW)
+        shots = []
+
+    if not media:
+        if permanent:
+            remove_url_from_picker(url)
+            quarantine_url_as_failed(url, reason=log[:500])
+        else:
+            print_step("!", "Download failed — URL kept in picker for retry", C.YELLOW)
+            write_job_log(f"PICKER_FAIL_KEEP {url}\n{log}")
+        return False
+
+    processed, errors = run_scraper(
+        only_files=media,
+        output_prefix="URL",
+        job_name=f"Picker:{url}",
+    )
+    success = processed > 0 and errors == 0
 
     if success:
         remove_url_from_picker(url)
@@ -4334,12 +4389,8 @@ def process_picker_url(url: str) -> bool:
             write_job_log(GROQ_KEY_MANAGER.balance_report())
         return True
 
-    if permanent:
-        remove_url_from_picker(url)
-        quarantine_url_as_failed(url, reason=log[:500])
-    else:
-        print_step("!", "Failed — URL kept in picker for retry", C.YELLOW)
-        write_job_log(f"PICKER_FAIL_KEEP {url}\n{log}")
+    print_step("!", "Download/scrape incomplete — URL kept in picker for retry", C.YELLOW)
+    write_job_log(f"PICKER_SCRAPE_FAIL_KEEP {url} scraped={processed} errors={errors}")
     return False
 
 
@@ -4403,8 +4454,6 @@ def main() -> None:
         # Drive scan succeeded (even with work) → CONTINUE to picker
 
         # 2) URL Picker
-        # Keep DONE_URL_LOG_FILE pointing at Completed Ultimate Media Tool URL.txt
-        # (already renamed in body). Also alias picker path names used by helpers.
         ensure_url_picker_file()
         picker_urls = load_urls_from_picker()
         if picker_urls:
@@ -4416,21 +4465,20 @@ def main() -> None:
                 except Exception as exc:
                     print_step("!", f"Picker job crashed: {exc}", C.RED)
                     write_job_log(f"PICKER_CRASH {url} :: {exc}\n{traceback.format_exc()}")
-            return
+        else:
+            # 3) Manual URL (8s) when picker empty
+            entered = get_url_with_timeout_umt(8)
+            if entered:
+                print_step("~", f"Manual URL: {entered}", C.BLUE)
+                process_picker_url(entered)
 
-        # 3) Manual URL (8s) then 4) local media
-        entered = get_url_with_timeout_umt(8)
-        if entered:
-            print_step("~", f"Manual URL: {entered}", C.BLUE)
-            process_picker_url(entered)
-            return
-
+        # 4) Local media (also after picker, matching intended workflow)
         locals_ = local_media_files()
-        if not locals_:
+        if locals_:
+            print_step("~", f"Processing {len(locals_)} local media file(s)", C.CYAN)
+            run_scraper(only_files=locals_, job_name="local")
+        elif not picker_urls:
             print_step("!", "No picker URLs, no manual URL, no local media.", C.YELLOW)
-            return
-        print_step("~", f"Processing {len(locals_)} local media file(s)", C.CYAN)
-        run_scraper(only_files=locals_, job_name="local")
     except KeyboardInterrupt:
         print_step("!", "Interrupted by user.", C.YELLOW)
     except Exception as exc:
