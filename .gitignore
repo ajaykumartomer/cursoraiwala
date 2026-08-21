@@ -1,0 +1,54 @@
+# Secrets / OAuth
+credentials.json
+token.json
+*.pem
+*.key
+.env
+.env.*
+
+# Groq / local secrets accidentally saved
+*secret*
+*api_key*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env/
+
+# Ultimate Media Tool outputs
+Combined Ultimate Media Tool/
+Combined Image Scraper by AKT/
+Combined Video Scraper by AKT/
+Combined Audio Scraper by AKT/
+Combine Image Scraper.txt
+Combine Video Scraper.txt
+Combine Audio Scraper.txt
+Downloaded Media Scraper by AKT/
+Social Media Screenshots/
+Social Media Videos/
+Screenshots/
+error_log*
+Error*.txt
+*_temp/
+.akt_media_tools/
+.akt_*
+
+# URL picker / job logs (local runtime)
+Ultimate Media Tool URL Picker.txt
+Completed Ultimate Media Tool URL.txt
+Ultimate Media Tool URL Picker Failed.txt
+Ultimate Media Tool Job Log.txt
+Completed Google Drive URLs.txt
+Done Social Media*
+Social Media SnapShottter*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
