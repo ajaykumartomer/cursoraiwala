@@ -573,39 +573,46 @@ def _rename_downloaded_video(
 
 def _ytdlp_format_selector() -> str:
     """
-    Quality rule:
-      1) Prefer up to 1080p (never higher).
-      2) Else drop to 720p.
-      3) Else take the best quality actually available.
+    Quality rule (resolution FIRST, container second):
+      1) Best video <= 1080p + best audio (any container; remux to mp4 later).
+      2) Else best single-file stream <= 1080p.
+      3) Else same ladder at 720p.
+      4) Else best available.
+
+    IMPORTANT: do NOT prefer [ext=mp4] before resolution — that used to lock
+    onto a 360p progressive MP4 while a 1080p webm/avc adaptive stream existed.
     """
     return (
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/"
-        "bv*[height<=1080]+ba/"
-        "b[height<=1080]/"
-        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
-        "bv*[height<=720]+ba/"
-        "b[height<=720]/"
+        "bestvideo*[height<=1080]+bestaudio/"
+        "bestvideo[height<=1080]+bestaudio/"
+        "best[height<=1080]/"
+        "bestvideo*[height<=720]+bestaudio/"
+        "best[height<=720]/"
         "bestvideo*+bestaudio/best"
     )
+
+
+def _ytdlp_format_sort() -> list:
+    """Force yt-dlp to rank by resolution near 1080p, not by codec/container quirks."""
+    return ["res:1080", "res", "br", "fps", "hdr:sdr", "codec:h264:aac", "size", "proto"]
 
 
 # ---------------------------------------------------------------------------
 # YouTube player-client ladder — COOKIE / BROWSER INDEPENDENT.
 #
-# Intentionally avoids clients that only work (or default) when browser
-# cookies are present (e.g. tv_downgraded). These clients extract public
-# streams via yt-dlp's Android / iOS / embedded web clients alone.
+# Clients that typically expose 1080p adaptive formats are tried first.
+# Android-only clients often only advertise 360p/720p progressive streams,
+# which previously caused 640x360 downloads even when 1080p existed.
 # ---------------------------------------------------------------------------
 YOUTUBE_PLAYER_CLIENT_LADDER = [
-    # Prefer clients that do not require browser cookies / TV cookie sessions.
+    "web_embedded,mweb",
+    "mweb,android",
+    "default,-tv,-tv_downgraded",
+    "tv_embedded",
     "android,ios",
     "android_vr,ios",
-    "web_embedded",
-    "mweb",
     "android_creator",
     "mediaconnect",
-    "tv_embedded",
-    "default,-tv,-tv_downgraded",
 ]
 
 
@@ -642,6 +649,8 @@ def _base_ytdlp_cmd(
         "--remux-video", "mp4",
         "--output", outtmpl,
         "--format", _ytdlp_format_selector(),
+        "--format-sort", ",".join(_ytdlp_format_sort()),
+        "--format-sort-force",
         "--add-header", f"User-Agent: {S24_CHROME_UA}",
         "--add-header", "Accept-Language: en-US,en;q=0.9",
         "--remote-components", "ejs:github",
@@ -1003,6 +1012,8 @@ def run_yt_dlp_download(
                 ydl_opts = {
                     "outtmpl": outtmpl,
                     "format": _ytdlp_format_selector(),
+                    "format_sort": _ytdlp_format_sort(),
+                    "format_sort_force": True,
                     "merge_output_format": "mp4",
                     "noplaylist": True,
                     "quiet": True,
